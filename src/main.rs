@@ -2,6 +2,7 @@ mod codex;
 mod config;
 mod desktop_control;
 mod hooks;
+mod lifecycle;
 mod recovery;
 mod telegram;
 mod ui;
@@ -30,6 +31,17 @@ async fn main() -> Result<()> {
         Some("--daemon") | Some("daemon") => {
             let cfg = config::load_or_create()?;
             telegram::run_bot(cfg).await?;
+        }
+        Some("--lifecycle") | Some("lifecycle") => {
+            lifecycle::run_lifecycle()?;
+        }
+        Some("--lifecycle-status") | Some("lifecycle-status") => {
+            let status = lifecycle::status()?;
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        Some("--install-launch-agent") | Some("install-launch-agent") => {
+            let path = lifecycle::install_launch_agent()?;
+            println!("installed launch agent: {}", path.display());
         }
         Some("--continue") | Some("continue") => {
             let cfg = config::load_or_create()?;
@@ -89,8 +101,11 @@ fn print_help() {
            codex-sentinel status       Print JSON status\n\
            codex-sentinel recoverable  Print recoverable recent threads\n\
            codex-sentinel daemon       Run Telegram bot loop\n\
+           codex-sentinel lifecycle    Follow Codex.app and manage Sentinel GUI/daemon\n\
            codex-sentinel continue [thread_id]\n\
            codex-sentinel desktop-control-status\n\
+           codex-sentinel lifecycle-status\n\
+           codex-sentinel install-launch-agent\n\
            codex-sentinel open-desktop-permissions\n\
            codex-sentinel hook-status\n\
            codex-sentinel install-hooks\n\
