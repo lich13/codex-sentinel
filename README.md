@@ -130,3 +130,16 @@ npm run build:ui
 ./scripts/package-macos.sh
 open "dist/Codex Sentinel.app"
 ```
+
+## GitHub Release
+
+线上构建只保留 macOS arm64：
+
+- `main` 和 PR：运行 macOS arm64 CI，并上传 DMG artifact。
+- tag 或手动 workflow：构建 DMG，并发布到 GitHub Release。
+
+手动发布：
+
+```sh
+gh workflow run release-build.yml --repo lich13/codex-sentinel -f version=0.1.0
+```

@@ -1,0 +1,247 @@
+name: Build and Release macOS arm64
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Optional version to publish as a tag/release, for example 0.1.0 or v0.1.0. Leave empty to only build artifacts.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-build-${{ github.ref_name || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  MACOSX_DEPLOYMENT_TARGET: '12.0'
+
+run-name: >-
+  ${{
+    github.event_name == 'workflow_dispatch' && inputs.version != ''
+      && format('Build and release {0}', inputs.version)
+      || github.event_name == 'workflow_dispatch'
+      && 'Build macOS arm64 artifacts (manual)'
+      || format('Build macOS arm64 for {0}', github.ref_name)
+  }}
+
+jobs:
+  resolve-version:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.app_version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve app version
+        id: app_version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            RAW_VERSION="${GITHUB_REF_NAME}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            RAW_VERSION="${{ inputs.version }}"
+          else
+            RAW_VERSION="$(node -e "console.log(require('./package.json').version)")"
+          fi
+
+          RAW_VERSION="${RAW_VERSION//[[:space:]]/}"
+          APP_VERSION="${RAW_VERSION#v}"
+
+          if [[ ! "${APP_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid app version: ${RAW_VERSION}" >&2
+            exit 1
+          fi
+
+          echo "version=${APP_VERSION}" >> "${GITHUB_OUTPUT}"
+
+  test-macos:
+    name: CI macOS arm64
+    needs: [resolve-version]
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run Rust tests
+        run: cargo test
+
+      - name: Build UI
+        run: npm run build:ui
+
+  build-macos:
+    name: Build macOS arm64 DMG
+    needs: [resolve-version, test-macos]
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync app version
+        run: node scripts/set-app-version.mjs --version "${{ needs.resolve-version.outputs.version }}"
+
+      - name: Build Tauri bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          max_attempts=2
+          attempt=1
+
+          while true; do
+            echo "macOS arm64 bundle attempt ${attempt}/${max_attempts}"
+
+            if npm run tauri -- build --bundles dmg --target aarch64-apple-darwin; then
+              break
+            fi
+
+            if [[ "${attempt}" -ge "${max_attempts}" ]]; then
+              echo "macOS arm64 bundle failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+
+            echo "Cleaning bundle output before retry..."
+            rm -rf target/aarch64-apple-darwin/release/bundle
+            attempt=$((attempt + 1))
+            sleep 20
+          done
+
+      - name: Postprocess macOS DMG
+        run: bash scripts/postprocess-macos-dmg.sh target/aarch64-apple-darwin/release/bundle/dmg "Codex Sentinel"
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-dmg-arm64
+          path: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          compression-level: 0
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.version != '')
+
+    steps:
+      - name: Download bundle artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Normalize release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+          else
+            RAW_VERSION="${{ inputs.version }}"
+            RAW_VERSION="${RAW_VERSION//[[:space:]]/}"
+            if [[ -z "${RAW_VERSION}" ]]; then
+              echo "Manual release requires a version input." >&2
+              exit 1
+            fi
+            if [[ "${RAW_VERSION}" == v* ]]; then
+              TAG_NAME="${RAW_VERSION}"
+            else
+              TAG_NAME="v${RAW_VERSION}"
+            fi
+          fi
+
+          echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t release_files < <(find release-assets -maxdepth 1 -type f -name '*.dmg' | sort)
+
+          if [[ "${#release_files[@]}" -eq 0 ]]; then
+            echo "No release assets found." >&2
+            exit 1
+          fi
+
+          TAG_NAME="${{ steps.tag.outputs.tag_name }}"
+
+          if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            RELEASE_ID="$(gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --json id -q '.id')"
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              -f target_commitish="${GITHUB_SHA}" \
+              -F generate_release_notes=true >/dev/null
+            gh release upload "${TAG_NAME}" "${release_files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create \
+              "${TAG_NAME}" \
+              "${release_files[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --generate-notes
+          fi

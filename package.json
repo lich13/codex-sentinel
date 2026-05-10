@@ -6,8 +6,12 @@
   "scripts": {
     "dev:ui": "vite --host 127.0.0.1 --port 5173 --strictPort",
     "build:ui": "vite build",
+    "check": "cargo check",
+    "test": "cargo test",
+    "ci": "cargo fmt -- --check && cargo test && npm run build:ui",
     "tauri": "tauri",
-    "tauri:build": "tauri build"
+    "tauri:build": "npm run tauri:build:mac:arm64",
+    "tauri:build:mac:arm64": "tauri build --bundles dmg --target aarch64-apple-darwin"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0"
