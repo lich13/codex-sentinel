@@ -29,14 +29,17 @@ Codex Sentinel 是一个本机 macOS 菜单栏工具，用 Rust/Tauri 监控 Cod
 Telegram 主菜单保持极简：
 
 ```text
-当前线程反馈
-一键继续
-状态
+当前线程
+继续当前
+新线程
 选择线程
+待恢复
+状态
+清除归档
 ```
 
-进入线程详情后可以 `刷新反馈`、`一键继续` 或 `输入指令`。自定义指令会直接打开对应
-Codex 线程并在可见输入框提交。
+进入线程详情后可以 `刷新反馈`、`继续`、`输入指令` 或 `删除线程`。
+`清除归档` 会清理已经归档的线程记录，并把归档 rollout 备份到 Sentinel 配置目录。
 
 ## 菜单栏
 
@@ -109,6 +112,9 @@ Stop -> codex-sentinel hook-stop
 ```
 
 Hook 事件写入 `~/.codex-sentinel/hook-events.jsonl`，包含来源、动作、延迟、分类结果和最后反馈快照。
+Sentinel 会在短时间内按 `event_key` 抑制重复 Stop 事件；需要较长退避的事件不会让 Stop
+hook 一直 sleep，而是交给 watcher、Telegram 或桌面面板稍后恢复。控制台会显示最近 Stop
+Hook 事件，并检查安装的 hook 是否指向 `/Applications/Codex Sentinel.app`。
 
 ## macOS 权限
 

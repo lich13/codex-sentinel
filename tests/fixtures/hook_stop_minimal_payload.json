@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "thread-without-turn",
+  "last_assistant_message": "completed without a final assistant message"
+}

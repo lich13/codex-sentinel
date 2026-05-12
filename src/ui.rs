@@ -11,12 +11,13 @@ use tauri::menu::{CheckMenuItem, MenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{Manager, WindowEvent};
 
-use crate::{codex, config, desktop_control, hooks};
+use crate::{codex, config, control_queue, desktop_control, hooks};
 
 const TRAY_ID: &str = "main";
 const TRAY_MENU_SHOW: &str = "tray-show";
 const TRAY_MENU_AUTO_RECOVER: &str = "tray-auto-recover";
 const TRAY_MENU_QUIT: &str = "tray-quit";
+const TELEGRAM_PANEL_HTTP_TIMEOUT_SECONDS: u64 = 20;
 
 struct TrayMenuState {
     auto_recover: CheckMenuItem<tauri::Wry>,
@@ -46,12 +47,27 @@ struct ConfigSummary {
     auto_recover: bool,
     max_recoveries_per_thread: u32,
     cooldown_seconds: u64,
+    continue_prompt: String,
+    tool_failure_prompt: String,
+    safety_rephrase_prompt: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ContinueResult {
     thread_id: String,
     turn_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeSettingsInput {
+    watch_enabled: bool,
+    poll_interval_seconds: u64,
+    auto_recover: bool,
+    max_recoveries_per_thread: u32,
+    cooldown_seconds: u64,
+    continue_prompt: String,
+    tool_failure_prompt: String,
+    safety_rephrase_prompt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +198,11 @@ pub fn run_gui() -> Result<()> {
             dashboard,
             install_hooks,
             continue_current_thread,
+            submit_thread_instruction,
+            start_new_thread,
+            archive_thread,
+            clear_archived_threads,
+            save_runtime_settings,
             set_auto_recover,
             save_telegram_settings,
             test_telegram_bot,
@@ -306,9 +327,98 @@ fn continue_current_thread(
                 .map(|thread| thread.id)
         })
         .ok_or_else(|| "没有找到最近的 Codex 线程".to_string())?;
-    let turn_id =
-        codex::continue_thread(&thread_id, &cfg.recovery.continue_prompt).map_err(format_error)?;
+    let response = control_queue::submit_and_wait(control_queue::ControlAction::Continue {
+        thread_id: thread_id.clone(),
+        prompt: cfg.recovery.continue_prompt,
+    })
+    .map_err(format_error)?;
+    let turn_id = response.turn_id.unwrap_or_default();
     Ok(ContinueResult { thread_id, turn_id })
+}
+
+#[tauri::command]
+fn submit_thread_instruction(
+    thread_id: String,
+    prompt: String,
+) -> std::result::Result<control_queue::ControlResponse, String> {
+    let thread_id = thread_id.trim();
+    let prompt = prompt.trim();
+    if thread_id.is_empty() {
+        return Err("线程 ID 为空".to_string());
+    }
+    if prompt.is_empty() {
+        return Err("追加指令为空".to_string());
+    }
+    control_queue::submit_and_wait(control_queue::ControlAction::Continue {
+        thread_id: thread_id.to_string(),
+        prompt: prompt.to_string(),
+    })
+    .map_err(format_error)
+}
+
+#[tauri::command]
+fn start_new_thread(
+    prompt: String,
+    path: Option<String>,
+) -> std::result::Result<control_queue::ControlResponse, String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("新线程指令为空".to_string());
+    }
+    control_queue::submit_and_wait(control_queue::ControlAction::NewThread {
+        prompt: prompt.to_string(),
+        path: path.and_then(|value| {
+            let trimmed = value.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        }),
+    })
+    .map_err(format_error)
+}
+
+#[tauri::command]
+fn archive_thread(thread_id: String) -> std::result::Result<DashboardPayload, String> {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return Err("线程 ID 为空".to_string());
+    }
+    control_queue::submit_and_wait(control_queue::ControlAction::ArchiveThread {
+        thread_id: thread_id.to_string(),
+    })
+    .map_err(format_error)?;
+    load_dashboard().map_err(format_error)
+}
+
+#[tauri::command]
+fn clear_archived_threads() -> std::result::Result<DashboardPayload, String> {
+    control_queue::submit_and_wait(control_queue::ControlAction::ClearArchived)
+        .map_err(format_error)?;
+    load_dashboard().map_err(format_error)
+}
+
+#[tauri::command]
+fn save_runtime_settings(
+    input: RuntimeSettingsInput,
+) -> std::result::Result<DashboardPayload, String> {
+    if input.poll_interval_seconds < 5 {
+        return Err("轮询间隔不能小于 5 秒".to_string());
+    }
+    if input.max_recoveries_per_thread == 0 {
+        return Err("恢复上限不能为 0".to_string());
+    }
+    if input.continue_prompt.trim().is_empty() {
+        return Err("默认续跑指令不能为空".to_string());
+    }
+    let mut cfg = config::load_or_create().map_err(format_error)?;
+    cfg.watch.enabled = input.watch_enabled;
+    cfg.watch.poll_interval_seconds = input.poll_interval_seconds;
+    cfg.watch.max_recoveries_per_thread = input.max_recoveries_per_thread;
+    cfg.watch.cooldown_seconds = input.cooldown_seconds;
+    cfg.recovery.auto_recover = input.auto_recover;
+    cfg.recovery.continue_prompt = input.continue_prompt.trim().to_string();
+    cfg.recovery.tool_failure_prompt = input.tool_failure_prompt.trim().to_string();
+    cfg.recovery.safety_rephrase_prompt = input.safety_rephrase_prompt.trim().to_string();
+    config::save(&cfg).map_err(format_error)?;
+    load_dashboard().map_err(format_error)
 }
 
 #[tauri::command]
@@ -345,7 +455,8 @@ async fn test_telegram_bot(
 ) -> std::result::Result<TelegramBotCheck, String> {
     let token = token_from_input_or_config(&input).map_err(format_error)?;
     let url = telegram_api_url(&token, "getMe");
-    let resp: TelegramApiResponse<TelegramMe> = Client::new()
+    let resp: TelegramApiResponse<TelegramMe> = telegram_client()
+        .map_err(format_error)?
         .get(url)
         .send()
         .await
@@ -375,7 +486,7 @@ async fn pair_telegram_bot(
 ) -> std::result::Result<TelegramPairResult, String> {
     let token = token_from_input_or_config(&input).map_err(format_error)?;
     let code = normalize_pair_code(&code).map_err(format_error)?;
-    let client = Client::new();
+    let client = telegram_client().map_err(format_error)?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut offset: Option<i64> = None;
 
@@ -481,7 +592,7 @@ async fn send_telegram_test_message(
         );
     }
 
-    let client = Client::new();
+    let client = telegram_client().map_err(format_error)?;
     for chat_id in &chat_ids {
         send_telegram_message(
             &client,
@@ -586,6 +697,9 @@ fn summarize_config(cfg: &config::AppConfig) -> ConfigSummary {
         auto_recover: cfg.recovery.auto_recover,
         max_recoveries_per_thread: cfg.watch.max_recoveries_per_thread,
         cooldown_seconds: cfg.watch.cooldown_seconds,
+        continue_prompt: cfg.recovery.continue_prompt.clone(),
+        tool_failure_prompt: cfg.recovery.tool_failure_prompt.clone(),
+        safety_rephrase_prompt: cfg.recovery.safety_rephrase_prompt.clone(),
     }
 }
 
@@ -768,6 +882,14 @@ fn label_chat(chat: &TelegramChat) -> String {
 
 fn telegram_api_url(token: &str, method: &str) -> String {
     format!("https://api.telegram.org/bot{token}/{method}")
+}
+
+fn telegram_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(TELEGRAM_PANEL_HTTP_TIMEOUT_SECONDS))
+        .pool_max_idle_per_host(0)
+        .build()
+        .context("failed to build Telegram HTTP client")
 }
 
 fn telegram_daemon_running() -> bool {

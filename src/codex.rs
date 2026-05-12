@@ -1,6 +1,8 @@
-use std::fs::File;
+use std::collections::HashSet;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -9,15 +11,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sysinfo::System;
 
-use crate::desktop_control;
+use crate::app_server_probe::ThreadProbe;
 use crate::recovery::{RecoveryDecision, RecoveryKind, classify_error};
+use crate::{app_server_probe, config, desktop_control};
 
 const THREAD_RECOVERY_LOOKBACK_SECONDS: i64 = 600;
 const THREAD_RECOVERY_MAX_LOOKBACK_SECONDS: i64 = 2 * 60 * 60;
+const THREAD_TERMINAL_QUIET_SECONDS: i64 = 30;
+const THREAD_EVENT_UPDATED_AT_GRACE_SECONDS: i64 = 60;
 const STATUS_LOG_LOOKBACK_SECONDS: i64 = 24 * 60 * 60;
 const ROLLOUT_RECOVERY_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 const ROLLOUT_FEEDBACK_SCAN_BYTES: u64 = 1024 * 1024;
 const ROLLOUT_MAX_PARSE_LINE_BYTES: usize = 512 * 1024;
+const VISIBLE_SUBMIT_ATTEMPTS: usize = 4;
+const VISIBLE_SUBMIT_WAIT: Duration = Duration::from_secs(4);
 const RECOVERY_LOG_TARGETS: &str = "(target IN ('codex_core::session::turn', 'codex_client::transport') \
           OR (target IN ('codex_otel.trace_safe', 'codex_otel.log_only') \
               AND feedback_log_body LIKE '%event.name=\"codex.sse_event\"%' \
@@ -50,6 +57,13 @@ pub struct ThreadSummary {
     pub cwd: String,
     pub updated_at: i64,
     pub rollout_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct NewThreadCandidate {
+    id: String,
+    updated_at: i64,
+    first_user_message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +100,21 @@ pub struct ThreadFeedback {
     pub title: String,
     pub timestamp: Option<String>,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadMutationResult {
+    pub thread_id: String,
+    pub title: String,
+    pub archived: bool,
+    pub rollout_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClearArchivedResult {
+    pub cleared_threads: usize,
+    pub moved_rollouts: usize,
+    pub cleanup_dir: String,
 }
 
 #[derive(Debug, Default)]
@@ -142,7 +171,9 @@ pub fn read_recent_threads(limit: usize) -> Result<Vec<ThreadSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, \
                 title, cwd, updated_at, rollout_path \
-         FROM threads ORDER BY updated_at DESC LIMIT ?1",
+         FROM threads \
+         WHERE coalesce(archived, 0) = 0 \
+         ORDER BY updated_at DESC LIMIT ?1",
     )?;
     let rows = stmt.query_map([limit as i64], |row| {
         Ok(ThreadSummary {
@@ -155,6 +186,113 @@ pub fn read_recent_threads(limit: usize) -> Result<Vec<ThreadSummary>> {
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+fn read_thread_ids(limit: usize) -> Result<HashSet<String>> {
+    let db_path = state_db_path();
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", db_path.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT id \
+         FROM threads \
+         ORDER BY updated_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(Into::into)
+}
+
+fn read_thread(conn: &Connection, thread_id: &str) -> Result<ThreadSummary> {
+    conn.query_row(
+        "SELECT id, title, cwd, updated_at, rollout_path \
+         FROM threads WHERE id = ?1",
+        [thread_id],
+        |row| {
+            Ok(ThreadSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                cwd: row.get(2)?,
+                updated_at: row.get(3)?,
+                rollout_path: row.get(4)?,
+            })
+        },
+    )
+    .with_context(|| format!("thread not found: {thread_id}"))
+}
+
+pub fn archive_thread(thread_id: &str) -> Result<ThreadMutationResult> {
+    let db_path = state_db_path();
+    let mut conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", db_path.display()))?;
+    let thread = read_thread(&conn, thread_id)?;
+    let now = Utc::now().timestamp();
+    let archived_rollout = archive_rollout_file(&thread.rollout_path)
+        .unwrap_or_else(|_| PathBuf::from(&thread.rollout_path));
+    let archived_rollout_text = archived_rollout.display().to_string();
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE threads \
+         SET archived = 1, archived_at = ?1, rollout_path = ?2 \
+         WHERE id = ?3",
+        (&now, &archived_rollout_text, thread_id),
+    )?;
+    tx.commit()?;
+    Ok(ThreadMutationResult {
+        thread_id: thread.id,
+        title: thread.title,
+        archived: true,
+        rollout_path: archived_rollout_text,
+    })
+}
+
+pub fn clear_archived_threads() -> Result<ClearArchivedResult> {
+    let db_path = state_db_path();
+    let mut conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", db_path.display()))?;
+    let archived = {
+        let mut stmt = conn.prepare(
+            "SELECT id, rollout_path FROM threads \
+             WHERE coalesce(archived, 0) != 0 OR archived_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let cleanup_dir = config::config_dir()
+        .join("cleared-archived-rollouts")
+        .join(Utc::now().format("%Y%m%d-%H%M%S").to_string());
+    fs::create_dir_all(&cleanup_dir)
+        .with_context(|| format!("failed to create {}", cleanup_dir.display()))?;
+
+    let mut moved_rollouts = 0;
+    for (_, rollout_path) in &archived {
+        if move_file_if_exists(Path::new(rollout_path), &cleanup_dir).is_ok() {
+            moved_rollouts += 1;
+        }
+    }
+
+    let tx = conn.transaction()?;
+    for (thread_id, _) in &archived {
+        tx.execute("DELETE FROM threads WHERE id = ?1", [thread_id])?;
+    }
+    tx.commit()?;
+
+    Ok(ClearArchivedResult {
+        cleared_threads: archived.len(),
+        moved_rollouts,
+        cleanup_dir: cleanup_dir.display().to_string(),
+    })
 }
 
 pub fn latest_log_like(where_clause: &str) -> Result<Option<LogEvent>> {
@@ -274,15 +412,30 @@ where
 pub fn recoverable_threads(limit: usize) -> Result<Vec<ThreadRecovery>> {
     let mut candidates = Vec::new();
     let now_ts = Utc::now().timestamp();
-    for thread in read_recent_threads(limit)? {
+    let recent_threads = read_recent_threads(limit)?;
+    let thread_ids = recent_threads
+        .iter()
+        .map(|thread| thread.id.clone())
+        .collect::<Vec<_>>();
+    let app_server_probes =
+        app_server_probe::read_thread_probes(&thread_ids).unwrap_or_else(|err| {
+            tracing::debug!("Codex app-server probe skipped for recoverable scan: {err:#}");
+            Default::default()
+        });
+
+    for thread in recent_threads {
         if thread.updated_at < now_ts.saturating_sub(THREAD_RECOVERY_MAX_LOOKBACK_SECONDS) {
             continue;
         }
-        let Some(event) = latest_recovery_event_for_thread(&thread)? else {
+        let app_server_probe = app_server_probes.get(&thread.id);
+        let Some(event) = latest_recovery_event_for_thread(&thread, app_server_probe)? else {
             continue;
         };
         let decision = classify_error(&event.body);
         if decision.kind != RecoveryKind::None {
+            if !recovery_event_is_terminal(&thread, &event, now_ts, app_server_probe)? {
+                continue;
+            }
             candidates.push(ThreadRecovery {
                 thread,
                 event,
@@ -293,9 +446,12 @@ pub fn recoverable_threads(limit: usize) -> Result<Vec<ThreadRecovery>> {
     Ok(candidates)
 }
 
-fn latest_recovery_event_for_thread(thread: &ThreadSummary) -> Result<Option<LogEvent>> {
+fn latest_recovery_event_for_thread(
+    thread: &ThreadSummary,
+    app_server_probe: Option<&ThreadProbe>,
+) -> Result<Option<LogEvent>> {
     let since_ts = thread_recovery_since(thread);
-    let mut log_event = latest_recovery_log_for_thread(&thread.id, since_ts)?;
+    let log_event = latest_recovery_log_for_thread(&thread.id, since_ts)?;
     let rollout_scan = match scan_rollout_recovery(&thread.rollout_path, &thread.id, since_ts) {
         Ok(scan) => scan,
         Err(err) => {
@@ -308,18 +464,48 @@ fn latest_recovery_event_for_thread(thread: &ThreadSummary) -> Result<Option<Log
         }
     };
 
+    Ok(select_latest_recovery_event(
+        since_ts,
+        log_event,
+        rollout_scan,
+        app_server_probe,
+    ))
+}
+
+fn select_latest_recovery_event(
+    since_ts: i64,
+    mut log_event: Option<LogEvent>,
+    rollout_scan: RolloutRecoveryScan,
+    app_server_probe: Option<&ThreadProbe>,
+) -> Option<LogEvent> {
     if let (Some(progress_ts), Some(log)) = (rollout_scan.normal_progress_ts, log_event.as_ref()) {
         if log.ts <= progress_ts {
             log_event = None;
         }
     }
 
-    Ok(match (log_event, rollout_scan.recovery) {
+    if let Some(probe) = app_server_probe {
+        if probe.is_known_running()
+            && app_server_probe_is_newer_than_event(probe, log_event.as_ref())
+        {
+            log_event = None;
+        }
+        if let Some(event) = app_server_probe_event(probe) {
+            if event.ts >= since_ts {
+                return Some(match log_event {
+                    Some(log) if log.ts > event.ts => log,
+                    _ => event,
+                });
+            }
+        }
+    }
+
+    match (log_event, rollout_scan.recovery) {
         (Some(log), Some(rollout)) => Some(if rollout.ts >= log.ts { rollout } else { log }),
         (Some(log), None) => Some(log),
         (None, Some(rollout)) => Some(rollout),
         (None, None) => None,
-    })
+    }
 }
 
 fn thread_recovery_since(thread: &ThreadSummary) -> i64 {
@@ -331,6 +517,143 @@ fn thread_recovery_since_at(thread: &ThreadSummary, now_ts: i64) -> i64 {
         .updated_at
         .saturating_sub(THREAD_RECOVERY_LOOKBACK_SECONDS)
         .max(now_ts.saturating_sub(THREAD_RECOVERY_MAX_LOOKBACK_SECONDS))
+}
+
+fn recovery_event_is_terminal(
+    thread: &ThreadSummary,
+    event: &LogEvent,
+    now_ts: i64,
+    app_server_probe: Option<&ThreadProbe>,
+) -> Result<bool> {
+    if let Some(probe) = app_server_probe {
+        if probe.has_terminal_failure() {
+            return Ok(true);
+        }
+        if probe.is_known_running() && app_server_probe_is_newer_than_event(probe, Some(event)) {
+            return Ok(false);
+        }
+    }
+    let latest_activity_ts =
+        latest_log_activity_for_thread(&thread.id, event.ts.saturating_add(1))?;
+    Ok(recovery_event_is_terminal_at(
+        thread,
+        event,
+        latest_activity_ts,
+        now_ts,
+    ))
+}
+
+fn app_server_probe_is_newer_than_event(probe: &ThreadProbe, event: Option<&LogEvent>) -> bool {
+    let Some(event) = event else {
+        return true;
+    };
+    probe.latest_turn_ts().is_some_and(|ts| {
+        ts >= event
+            .ts
+            .saturating_sub(THREAD_EVENT_UPDATED_AT_GRACE_SECONDS)
+    })
+}
+
+fn app_server_probe_event(probe: &ThreadProbe) -> Option<LogEvent> {
+    if !probe.has_terminal_failure() {
+        return None;
+    }
+    let status = probe
+        .latest_turn_status
+        .as_deref()
+        .or(probe.thread_status.as_deref())
+        .unwrap_or("failed");
+    let body = probe.latest_turn_error.clone().unwrap_or_else(|| {
+        if probe.thread_status.as_deref() == Some("systemError") {
+            "Codex app-server reported terminal thread status: systemError".to_string()
+        } else {
+            format!("Codex app-server reported terminal turn status: {status}")
+        }
+    });
+    Some(LogEvent {
+        ts: probe
+            .latest_turn_ts()
+            .unwrap_or_else(|| Utc::now().timestamp()),
+        level: "ERROR".to_string(),
+        target: probe.source.clone(),
+        thread_id: Some(probe.thread_id.clone()),
+        body,
+    })
+}
+
+fn recovery_event_is_terminal_at(
+    thread: &ThreadSummary,
+    event: &LogEvent,
+    latest_activity_ts: Option<i64>,
+    now_ts: i64,
+) -> bool {
+    if event.ts > now_ts {
+        return false;
+    }
+    if now_ts.saturating_sub(event.ts) < THREAD_TERMINAL_QUIET_SECONDS {
+        return false;
+    }
+    if thread.updated_at
+        > event
+            .ts
+            .saturating_add(THREAD_EVENT_UPDATED_AT_GRACE_SECONDS)
+    {
+        return false;
+    }
+
+    let Some(activity_ts) = latest_activity_ts else {
+        return true;
+    };
+    if now_ts.saturating_sub(activity_ts) < THREAD_TERMINAL_QUIET_SECONDS {
+        return false;
+    }
+    activity_ts
+        <= event
+            .ts
+            .saturating_add(THREAD_EVENT_UPDATED_AT_GRACE_SECONDS)
+}
+
+fn latest_log_activity_for_thread(thread_id: &str, since_ts: i64) -> Result<Option<i64>> {
+    latest_log_activity_for_thread_from_db(&logs_db_path(), thread_id, since_ts)
+}
+
+fn latest_log_activity_for_thread_from_db(
+    db_path: &Path,
+    thread_id: &str,
+    since_ts: i64,
+) -> Result<Option<i64>> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", db_path.display()))?;
+    let patterns = thread_match_patterns(thread_id);
+    let sql = format!(
+        "SELECT ts \
+         FROM logs \
+         WHERE ts >= ?1 \
+           AND (thread_id = ?2 \
+                OR ((thread_id IS NULL OR thread_id = '') \
+                    AND (feedback_log_body LIKE ?3 \
+                         OR feedback_log_body LIKE ?4 \
+                         OR feedback_log_body LIKE ?5) \
+                    AND {RECOVERY_LOG_NOISE_FILTER})) \
+         ORDER BY ts DESC, ts_nanos DESC, id DESC \
+         LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query((
+        &since_ts,
+        thread_id,
+        &patterns[0],
+        &patterns[1],
+        &patterns[2],
+    ))?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn latest_thread_feedback(thread_id: &str) -> Result<ThreadFeedback> {
@@ -688,8 +1011,13 @@ pub fn collect_status() -> Result<SentinelStatus> {
     let latest_tool_error =
         latest_log_like("level='ERROR' AND target='codex_core::tools::router'")?;
     let active_thread = recent_threads.first();
+    let active_app_server_probe = active_thread
+        .and_then(|thread| app_server_probe::read_thread_probe(&thread.id).ok())
+        .flatten();
     let active_recovery_source = active_thread
-        .and_then(|thread| latest_recovery_event_for_thread(thread).ok())
+        .and_then(|thread| {
+            latest_recovery_event_for_thread(thread, active_app_server_probe.as_ref()).ok()
+        })
         .flatten();
     let active_thread_id = active_thread.map(|thread| thread.id.as_str());
     let active_since = active_thread.map(thread_recovery_since).unwrap_or(0);
@@ -748,12 +1076,216 @@ fn read_tail_lines(path: &Path, max_bytes: u64) -> Result<Vec<String>> {
     Ok(text.lines().map(str::to_string).collect())
 }
 
-pub fn continue_thread(thread_id: &str, prompt: &str) -> Result<String> {
-    Ok(desktop_control::continue_thread_visible(thread_id, prompt)?.turn_id)
+fn archive_rollout_file(path: &str) -> Result<PathBuf> {
+    let source = Path::new(path);
+    if !source.exists() {
+        return Ok(source.to_path_buf());
+    }
+    if source
+        .components()
+        .any(|component| component.as_os_str() == "archived_sessions")
+    {
+        return Ok(source.to_path_buf());
+    }
+    let archive_dir = codex_home().join("archived_sessions");
+    fs::create_dir_all(&archive_dir)
+        .with_context(|| format!("failed to create {}", archive_dir.display()))?;
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| anyhow!("rollout path has no file name: {}", source.display()))?;
+    let dest = unique_dest(&archive_dir.join(file_name));
+    fs::rename(source, &dest)
+        .or_else(|_| {
+            fs::copy(source, &dest)?;
+            fs::remove_file(source)
+        })
+        .with_context(|| format!("failed to move rollout {} to archive", source.display()))?;
+    Ok(dest)
 }
 
-pub fn continue_thread_blocking(thread_id: &str, prompt: &str) -> Result<String> {
-    continue_thread(thread_id, prompt)
+fn move_file_if_exists(source: &Path, dest_dir: &Path) -> Result<()> {
+    if !source.exists() {
+        return Err(anyhow!("{} does not exist", source.display()));
+    }
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| anyhow!("path has no file name: {}", source.display()))?;
+    let dest = unique_dest(&dest_dir.join(file_name));
+    fs::rename(source, &dest)
+        .or_else(|_| {
+            fs::copy(source, &dest)?;
+            fs::remove_file(source)
+        })
+        .with_context(|| format!("failed to move {} to {}", source.display(), dest.display()))?;
+    Ok(())
+}
+
+fn unique_dest(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let ext = path.extension().and_then(|value| value.to_str());
+    for index in 1.. {
+        let name = match ext {
+            Some(ext) => format!("{stem}-{index}.{ext}"),
+            None => format!("{stem}-{index}"),
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+pub fn continue_thread(thread_id: &str, prompt: &str) -> Result<String> {
+    let baseline = read_thread_submit_marker(thread_id)?;
+    desktop_control::prepare_existing_thread_visible(thread_id)?;
+    let submit_baseline = read_thread_submit_marker(thread_id).unwrap_or(baseline.clone());
+
+    for attempt in 0..VISIBLE_SUBMIT_ATTEMPTS {
+        desktop_control::submit_prompt_to_visible_window(prompt, attempt)?;
+        if wait_for_thread_update(
+            thread_id,
+            submit_baseline.updated_at_ms,
+            VISIBLE_SUBMIT_WAIT,
+        )? {
+            return Ok(desktop_control::visible_turn_id());
+        }
+    }
+
+    Err(anyhow!(
+        "未能确认 Codex APP 已将追加指令写入线程 {thread_id}。请回到 Codex 窗口确认输入框是否有残留内容后重试。"
+    ))
+}
+
+pub fn start_new_thread(
+    prompt: &str,
+    path: Option<&str>,
+) -> Result<desktop_control::VisibleNewThreadResult> {
+    let before = read_thread_ids(250).unwrap_or_default();
+    let started_at = Utc::now().timestamp();
+    desktop_control::prepare_new_thread_visible(path)?;
+    let mut result = desktop_control::VisibleNewThreadResult {
+        thread_id: None,
+        turn_id: desktop_control::visible_turn_id(),
+        transport: "visible_desktop".to_string(),
+    };
+
+    for attempt in 0..VISIBLE_SUBMIT_ATTEMPTS {
+        desktop_control::submit_new_thread_prompt_to_visible_window(prompt, attempt)?;
+        if let Some(thread) =
+            wait_for_new_thread_match(&before, prompt, started_at, VISIBLE_SUBMIT_WAIT)?
+        {
+            result.thread_id = Some(thread.id);
+            return Ok(result);
+        }
+    }
+
+    Err(anyhow!(
+        "未能确认 Codex APP 已创建新线程，本次新线程请求未返回成功。为避免把指令误发到旧线程，请切到 Codex APP 确认是否停留在新聊天页后重试。"
+    ))
+}
+
+fn wait_for_new_thread_match(
+    before: &HashSet<String>,
+    prompt: &str,
+    started_at: i64,
+    timeout: Duration,
+) -> Result<Option<NewThreadCandidate>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(thread) = read_new_thread_candidates(50)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|thread| {
+                !before.contains(&thread.id)
+                    && thread.updated_at >= started_at - 2
+                    && prompts_match(&thread.first_user_message, prompt)
+            })
+        {
+            return Ok(Some(thread));
+        }
+        std::thread::sleep(Duration::from_millis(280));
+    }
+    Ok(None)
+}
+
+fn wait_for_thread_update(
+    thread_id: &str,
+    baseline_updated_at_ms: i64,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let current = read_thread_submit_marker(thread_id)?;
+        if current.updated_at_ms > baseline_updated_at_ms {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(240));
+    }
+    Ok(false)
+}
+
+#[derive(Debug, Clone)]
+struct ThreadSubmitMarker {
+    updated_at_ms: i64,
+}
+
+fn read_thread_submit_marker(thread_id: &str) -> Result<ThreadSubmitMarker> {
+    let db_path = state_db_path();
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", db_path.display()))?;
+    conn.query_row(
+        "SELECT coalesce(updated_at_ms, updated_at * 1000) \
+         FROM threads WHERE id = ?1",
+        [thread_id],
+        |row| {
+            Ok(ThreadSubmitMarker {
+                updated_at_ms: row.get::<_, i64>(0)?,
+            })
+        },
+    )
+    .with_context(|| format!("thread not found: {thread_id}"))
+}
+
+fn read_new_thread_candidates(limit: usize) -> Result<Vec<NewThreadCandidate>> {
+    let db_path = state_db_path();
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", db_path.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, updated_at, first_user_message \
+         FROM threads \
+         ORDER BY updated_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        Ok(NewThreadCandidate {
+            id: row.get(0)?,
+            updated_at: row.get(1)?,
+            first_user_message: row.get(2)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn prompts_match(stored: &str, prompt: &str) -> bool {
+    normalize_prompt(stored) == normalize_prompt(prompt)
+}
+
+fn normalize_prompt(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -969,6 +1501,41 @@ mod tests {
     }
 
     #[test]
+    fn completed_app_server_probe_does_not_suppress_silent_rollout_completion() {
+        let probe = ThreadProbe {
+            thread_id: "thread-a".to_string(),
+            thread_status: Some("notLoaded".to_string()),
+            latest_turn_id: Some("turn-silent".to_string()),
+            latest_turn_status: Some("completed".to_string()),
+            latest_turn_error: None,
+            latest_turn_started_at: Some(1_778_567_000),
+            latest_turn_completed_at: Some(1_778_567_161),
+            source: "codex_app_server_thread_read".to_string(),
+        };
+        let rollout_event = LogEvent {
+            ts: 1_778_567_161,
+            level: "WARN".to_string(),
+            target: "codex_sentinel::rollout".to_string(),
+            thread_id: Some("thread-a".to_string()),
+            body: "Silent turn completion: thread thread-a turn turn-silent completed without a final assistant message".to_string(),
+        };
+
+        let selected = select_latest_recovery_event(
+            1_778_567_000,
+            None,
+            RolloutRecoveryScan {
+                recovery: Some(rollout_event),
+                normal_progress_ts: None,
+            },
+            Some(&probe),
+        )
+        .expect("silent completion remains recoverable");
+
+        assert_eq!(selected.target, "codex_sentinel::rollout");
+        assert_eq!(classify_error(&selected.body).kind, RecoveryKind::RetrySoon);
+    }
+
+    #[test]
     fn rollout_lookup_stops_after_latest_normal_agent_message() {
         let path = temp_db_path("rollout-normal-after-silent").with_extension("jsonl");
         let raw = [
@@ -1044,6 +1611,172 @@ mod tests {
             thread_recovery_since_at(&thread, 1_778_328_800),
             1_778_328_734 - THREAD_RECOVERY_LOOKBACK_SECONDS
         );
+    }
+
+    #[test]
+    fn terminal_gate_waits_for_quiet_period() {
+        let thread = ThreadSummary {
+            id: "thread-a".to_string(),
+            title: "thread".to_string(),
+            cwd: "/tmp".to_string(),
+            updated_at: 1_778_303_650,
+            rollout_path: "/tmp/rollout.jsonl".to_string(),
+        };
+        let event = LogEvent {
+            ts: 1_778_303_650,
+            level: "INFO".to_string(),
+            target: "codex_core::session::turn".to_string(),
+            thread_id: Some("thread-a".to_string()),
+            body: "Turn error: exceeded retry limit, last status: 429 Too Many Requests"
+                .to_string(),
+        };
+
+        assert!(!recovery_event_is_terminal_at(
+            &thread,
+            &event,
+            None,
+            1_778_303_670
+        ));
+        assert!(recovery_event_is_terminal_at(
+            &thread,
+            &event,
+            None,
+            1_778_303_681
+        ));
+    }
+
+    #[test]
+    fn terminal_gate_ignores_errors_followed_by_thread_progress() {
+        let thread = ThreadSummary {
+            id: "thread-a".to_string(),
+            title: "thread".to_string(),
+            cwd: "/tmp".to_string(),
+            updated_at: 1_778_303_800,
+            rollout_path: "/tmp/rollout.jsonl".to_string(),
+        };
+        let event = LogEvent {
+            ts: 1_778_303_650,
+            level: "INFO".to_string(),
+            target: "codex_core::session::turn".to_string(),
+            thread_id: Some("thread-a".to_string()),
+            body: "Turn error: exceeded retry limit, last status: 429 Too Many Requests"
+                .to_string(),
+        };
+
+        assert!(!recovery_event_is_terminal_at(
+            &thread,
+            &event,
+            None,
+            1_778_303_900
+        ));
+    }
+
+    #[test]
+    fn terminal_gate_ignores_errors_while_logs_are_still_active() {
+        let thread = ThreadSummary {
+            id: "thread-a".to_string(),
+            title: "thread".to_string(),
+            cwd: "/tmp".to_string(),
+            updated_at: 1_778_303_650,
+            rollout_path: "/tmp/rollout.jsonl".to_string(),
+        };
+        let event = LogEvent {
+            ts: 1_778_303_650,
+            level: "INFO".to_string(),
+            target: "codex_core::session::turn".to_string(),
+            thread_id: Some("thread-a".to_string()),
+            body: "Turn error: exceeded retry limit, last status: 429 Too Many Requests"
+                .to_string(),
+        };
+
+        assert!(!recovery_event_is_terminal_at(
+            &thread,
+            &event,
+            Some(1_778_303_890),
+            1_778_303_900
+        ));
+    }
+
+    #[test]
+    fn terminal_gate_ignores_errors_with_late_thread_activity() {
+        let thread = ThreadSummary {
+            id: "thread-a".to_string(),
+            title: "thread".to_string(),
+            cwd: "/tmp".to_string(),
+            updated_at: 1_778_303_650,
+            rollout_path: "/tmp/rollout.jsonl".to_string(),
+        };
+        let event = LogEvent {
+            ts: 1_778_303_650,
+            level: "INFO".to_string(),
+            target: "codex_core::session::turn".to_string(),
+            thread_id: Some("thread-a".to_string()),
+            body: "Turn error: exceeded retry limit, last status: 429 Too Many Requests"
+                .to_string(),
+        };
+
+        assert!(!recovery_event_is_terminal_at(
+            &thread,
+            &event,
+            Some(1_778_303_730),
+            1_778_303_900
+        ));
+    }
+
+    #[test]
+    fn terminal_gate_allows_stale_error_without_later_activity() {
+        let thread = ThreadSummary {
+            id: "thread-a".to_string(),
+            title: "thread".to_string(),
+            cwd: "/tmp".to_string(),
+            updated_at: 1_778_303_650,
+            rollout_path: "/tmp/rollout.jsonl".to_string(),
+        };
+        let event = LogEvent {
+            ts: 1_778_303_650,
+            level: "INFO".to_string(),
+            target: "codex_core::session::turn".to_string(),
+            thread_id: Some("thread-a".to_string()),
+            body: "Turn error: exceeded retry limit, last status: 429 Too Many Requests"
+                .to_string(),
+        };
+
+        assert!(recovery_event_is_terminal_at(
+            &thread,
+            &event,
+            Some(1_778_303_660),
+            1_778_303_900
+        ));
+    }
+
+    #[test]
+    fn latest_log_activity_matches_thread_column_or_otel_body() {
+        let db = temp_db_path("latest-log-activity");
+        let conn = Connection::open(&db).expect("create temp db");
+        create_logs_table(&conn);
+        conn.execute(
+            "INSERT INTO logs (id, ts, ts_nanos, level, target, thread_id, feedback_log_body)
+             VALUES (1, 1778303650, 1, 'INFO', 'codex_core::session::turn', 'thread-a', ?1)",
+            ["turn activity"],
+        )
+        .expect("insert thread activity");
+        conn.execute(
+            "INSERT INTO logs (id, ts, ts_nanos, level, target, thread_id, feedback_log_body)
+             VALUES (2, 1778303660, 1, 'INFO', 'codex_otel.trace_safe', NULL, ?1)",
+            ["event.name=\"codex.sse_event\" conversation.id=thread-a event.kind=response.output_text.delta"],
+        )
+        .expect("insert embedded thread activity");
+        drop(conn);
+
+        let activity = latest_log_activity_for_thread_from_db(&db, "thread-a", 1778303640)
+            .expect("lookup succeeds");
+        assert_eq!(activity, Some(1778303660));
+
+        let stale = latest_log_activity_for_thread_from_db(&db, "thread-a", 1778303661)
+            .expect("lookup succeeds");
+        assert!(stale.is_none());
+
+        let _ = fs::remove_file(db);
     }
 
     #[test]

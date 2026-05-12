@@ -4,7 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Codex Sentinel"
 APP_DIR="$ROOT/dist/${APP_NAME}.app"
-SIGNING_IDENTITY="${CODEX_SENTINEL_SIGNING_IDENTITY:--}"
+SIGNING_IDENTITY="${CODEX_SENTINEL_SIGNING_IDENTITY:-}"
+if [ -z "$SIGNING_IDENTITY" ]; then
+  if security find-identity -v -p codesigning 2>/dev/null | grep -q 'Codex Sentinel Local Code Signing'; then
+    SIGNING_IDENTITY="Codex Sentinel Local Code Signing"
+  else
+    SIGNING_IDENTITY="-"
+  fi
+fi
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)"
 ARCH="$(uname -m | sed 's/^arm64$/aarch64/;s/^x86_64$/x64/')"
 

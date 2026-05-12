@@ -2,6 +2,7 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
   root: 'ui',
+  base: './',
   clearScreen: false,
   build: {
     outDir: '../ui-dist',

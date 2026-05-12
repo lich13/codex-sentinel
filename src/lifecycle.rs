@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
-use sysinfo::System;
+use sysinfo::{ProcessStatus, System};
 
 use crate::config;
 
@@ -18,9 +18,11 @@ pub struct LifecycleStatus {
     pub codex_running: bool,
     pub sentinel_gui_running: bool,
     pub daemon_running: bool,
+    pub control_worker_running: bool,
     pub lifecycle_running: bool,
     pub gui_pids: Vec<u32>,
     pub daemon_pids: Vec<u32>,
+    pub control_worker_pids: Vec<u32>,
     pub lifecycle_pids: Vec<u32>,
     pub launch_agent_path: String,
 }
@@ -30,6 +32,7 @@ struct ProcessSnapshot {
     codex_running: bool,
     gui_pids: Vec<u32>,
     daemon_pids: Vec<u32>,
+    control_worker_pids: Vec<u32>,
     lifecycle_pids: Vec<u32>,
 }
 
@@ -37,6 +40,7 @@ struct ProcessSnapshot {
 enum SentinelRole {
     Gui,
     Daemon,
+    ControlWorker,
     Lifecycle,
     Other,
 }
@@ -50,6 +54,7 @@ pub fn run_lifecycle() -> Result<()> {
         if snapshot.codex_running {
             ensure_gui_running(&snapshot)?;
             ensure_daemon_running(&snapshot)?;
+            ensure_control_worker_running(&snapshot)?;
         } else {
             stop_followed_processes(&snapshot)?;
         }
@@ -63,9 +68,11 @@ pub fn status() -> Result<LifecycleStatus> {
         codex_running: snapshot.codex_running,
         sentinel_gui_running: !snapshot.gui_pids.is_empty(),
         daemon_running: !snapshot.daemon_pids.is_empty(),
+        control_worker_running: !snapshot.control_worker_pids.is_empty(),
         lifecycle_running: !snapshot.lifecycle_pids.is_empty(),
         gui_pids: snapshot.gui_pids,
         daemon_pids: snapshot.daemon_pids,
+        control_worker_pids: snapshot.control_worker_pids,
         lifecycle_pids: snapshot.lifecycle_pids,
         launch_agent_path: launch_agent_path().display().to_string(),
     })
@@ -88,6 +95,16 @@ pub fn install_launch_agent() -> Result<PathBuf> {
     Ok(path)
 }
 
+pub fn ensure_control_worker_running_for_queue() -> Result<()> {
+    let snapshot = inspect_processes()?;
+    if !snapshot.codex_running {
+        return Err(anyhow!(
+            "Codex APP 未运行，无法通过可见窗口处理控制队列。请先打开 Codex APP。"
+        ));
+    }
+    ensure_control_worker_running(&snapshot)
+}
+
 fn ensure_gui_running(snapshot: &ProcessSnapshot) -> Result<()> {
     if !snapshot.gui_pids.is_empty() {
         return Ok(());
@@ -105,33 +122,54 @@ fn ensure_gui_running(snapshot: &ProcessSnapshot) -> Result<()> {
     }
 }
 
+fn ensure_control_worker_running(snapshot: &ProcessSnapshot) -> Result<()> {
+    if !snapshot.control_worker_pids.is_empty() {
+        return Ok(());
+    }
+    spawn_role_process(
+        "control-worker",
+        &config::config_dir().join("control-worker.out.log"),
+        &config::config_dir().join("control-worker.err.log"),
+        "started Codex Sentinel control worker because Codex is running",
+    )
+}
+
 fn ensure_daemon_running(snapshot: &ProcessSnapshot) -> Result<()> {
     if !snapshot.daemon_pids.is_empty() {
         return Ok(());
     }
+    spawn_role_process(
+        "daemon",
+        &config::config_dir().join("telegram-daemon.out.log"),
+        &config::config_dir().join("telegram-daemon.err.log"),
+        "started Codex Sentinel daemon because Codex is running",
+    )
+}
+
+fn spawn_role_process(
+    role: &str,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    message: &str,
+) -> Result<()> {
     let exe = current_exe()?;
-    let log_path = config::config_dir().join("telegram-daemon.out.log");
-    let err_path = config::config_dir().join("telegram-daemon.err.log");
     fs::create_dir_all(config::config_dir())?;
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)?;
+        .open(stdout_path)?;
     let stderr = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&err_path)?;
+        .open(stderr_path)?;
     let child = Command::new(&exe)
-        .arg("daemon")
+        .arg(role)
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .with_context(|| format!("failed to start daemon from {}", exe.display()))?;
-    tracing::info!(
-        pid = child.id(),
-        "started Codex Sentinel daemon because Codex is running"
-    );
+        .with_context(|| format!("failed to start {role} from {}", exe.display()))?;
+    tracing::info!(pid = child.id(), role, "{message}");
     Ok(())
 }
 
@@ -140,6 +178,7 @@ fn stop_followed_processes(snapshot: &ProcessSnapshot) -> Result<()> {
         .gui_pids
         .iter()
         .chain(snapshot.daemon_pids.iter())
+        .chain(snapshot.control_worker_pids.iter())
         .copied()
     {
         tracing::info!(
@@ -174,10 +213,14 @@ fn inspect_processes() -> Result<ProcessSnapshot> {
         codex_running: false,
         gui_pids: Vec::new(),
         daemon_pids: Vec::new(),
+        control_worker_pids: Vec::new(),
         lifecycle_pids: Vec::new(),
     };
 
     for process in sys.processes().values() {
+        if process.status() == ProcessStatus::Zombie {
+            continue;
+        }
         let cmd = process
             .cmd()
             .iter()
@@ -199,6 +242,7 @@ fn inspect_processes() -> Result<ProcessSnapshot> {
         match sentinel_role(&cmd) {
             SentinelRole::Gui => snapshot.gui_pids.push(pid),
             SentinelRole::Daemon => snapshot.daemon_pids.push(pid),
+            SentinelRole::ControlWorker => snapshot.control_worker_pids.push(pid),
             SentinelRole::Lifecycle => snapshot.lifecycle_pids.push(pid),
             SentinelRole::Other => {}
         }
@@ -206,6 +250,7 @@ fn inspect_processes() -> Result<ProcessSnapshot> {
 
     snapshot.gui_pids.sort_unstable();
     snapshot.daemon_pids.sort_unstable();
+    snapshot.control_worker_pids.sort_unstable();
     snapshot.lifecycle_pids.sort_unstable();
     Ok(snapshot)
 }
@@ -227,6 +272,9 @@ fn sentinel_role(cmd: &[String]) -> SentinelRole {
     if has_mode_arg(cmd, "daemon") || has_mode_arg(cmd, "--daemon") {
         return SentinelRole::Daemon;
     }
+    if has_mode_arg(cmd, "control-worker") || has_mode_arg(cmd, "--control-worker") {
+        return SentinelRole::ControlWorker;
+    }
     if has_mode_arg(cmd, "lifecycle") || has_mode_arg(cmd, "--lifecycle") {
         return SentinelRole::Lifecycle;
     }
@@ -239,8 +287,20 @@ fn sentinel_role(cmd: &[String]) -> SentinelRole {
                 | "--recoverable"
                 | "continue"
                 | "--continue"
+                | "append"
+                | "--append"
+                | "new"
+                | "--new"
+                | "delete"
+                | "--delete"
+                | "clear-archived"
+                | "--clear-archived"
                 | "desktop-control-status"
                 | "--desktop-control-status"
+                | "debug-new-chat"
+                | "--debug-new-chat"
+                | "debug-new-direct"
+                | "--debug-new-direct"
                 | "open-desktop-permissions"
                 | "--open-desktop-permissions"
                 | "hook-status"
@@ -399,6 +459,10 @@ mod tests {
         assert_eq!(
             sentinel_role(&cmd(&["codex-sentinel", "daemon"])),
             SentinelRole::Daemon
+        );
+        assert_eq!(
+            sentinel_role(&cmd(&["codex-sentinel", "control-worker"])),
+            SentinelRole::ControlWorker
         );
         assert_eq!(
             sentinel_role(&cmd(&["codex-sentinel", "lifecycle"])),

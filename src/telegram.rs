@@ -3,18 +3,24 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
+use reqwest::Url;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
 use crate::config::AppConfig;
 use crate::recovery::{RecoveryDecision, RecoveryKind, sanitized_recovery_text};
-use crate::{codex, config, desktop_control};
+use crate::{codex, config, control_queue, desktop_control};
+
+const TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS: u64 = 0;
+const TELEGRAM_EMPTY_POLL_SLEEP_SECONDS: u64 = 2;
+const TELEGRAM_HTTP_TIMEOUT_SECONDS: u64 = 12;
 
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
     ok: bool,
-    result: T,
+    result: Option<T>,
+    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,17 +64,18 @@ struct BotReply {
 #[derive(Debug)]
 enum PendingAction {
     ThreadInstruction { thread_id: String },
+    NewThread,
 }
 
 pub async fn run_bot(cfg: AppConfig) -> Result<()> {
     let mut cfg = cfg;
+    let client = telegram_client()?;
     if !cfg.telegram.enabled || cfg.telegram.bot_token.trim().is_empty() {
         tracing::info!("telegram disabled; running local watcher only");
-        watch_loop(cfg, Client::new()).await;
+        watch_loop(cfg, client).await;
         return Ok(());
     }
 
-    let client = Client::new();
     let watcher_cfg = cfg.clone();
     let watcher_client = client.clone();
     tokio::spawn(async move {
@@ -85,28 +92,47 @@ pub async fn run_bot(cfg: AppConfig) -> Result<()> {
                 cfg = fresh;
             }
         }
-        let url = api_url(&cfg.telegram.bot_token, "getUpdates");
-        let resp: TelegramResponse<Vec<Update>> = client
-            .post(url)
-            .json(&json!({
-                "timeout": 30,
-                "offset": offset,
-                "allowed_updates": ["message", "callback_query"]
-            }))
-            .send()
-            .await?
-            .json()
-            .await?;
+        let resp = match get_updates(&client, &cfg.telegram.bot_token, offset).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::warn!(
+                    error = %redact_telegram_token(&format!("{err:#}")),
+                    "telegram getUpdates failed"
+                );
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
         if !resp.ok {
+            let description = resp
+                .description
+                .unwrap_or_else(|| "telegram getUpdates returned ok=false".to_string());
+            tracing::warn!(
+                error = %redact_telegram_token(&description),
+                "telegram getUpdates returned ok=false"
+            );
             sleep(Duration::from_secs(5)).await;
             continue;
         }
 
-        for update in resp.result {
+        let updates = resp.result.unwrap_or_default();
+        if updates.is_empty() {
+            sleep(Duration::from_secs(TELEGRAM_EMPTY_POLL_SLEEP_SECONDS)).await;
+            continue;
+        }
+
+        for update in updates {
             offset = update.update_id + 1;
 
             if let Some(callback) = update.callback_query {
-                answer_callback_query(&client, &cfg.telegram.bot_token, &callback.id).await?;
+                if let Err(err) =
+                    answer_callback_query(&client, &cfg.telegram.bot_token, &callback.id).await
+                {
+                    tracing::warn!(
+                        error = %redact_telegram_token(&format!("{err:#}")),
+                        "telegram answerCallbackQuery failed"
+                    );
+                }
                 let Some(message) = callback.message else {
                     continue;
                 };
@@ -117,8 +143,16 @@ pub async fn run_bot(cfg: AppConfig) -> Result<()> {
                 let reply =
                     handle_callback(&cfg, message.chat.id, &data, &mut recoveries, &mut pending)
                         .await;
-                send_handled_reply(&client, &cfg.telegram.bot_token, message.chat.id, reply)
-                    .await?;
+                if let Err(err) =
+                    send_handled_reply(&client, &cfg.telegram.bot_token, message.chat.id, reply)
+                        .await
+                {
+                    tracing::warn!(
+                        chat_id = message.chat.id,
+                        error = %redact_telegram_token(&format!("{err:#}")),
+                        "telegram reply failed"
+                    );
+                }
                 continue;
             }
 
@@ -130,8 +164,16 @@ pub async fn run_bot(cfg: AppConfig) -> Result<()> {
             };
             if is_pair_command(text) {
                 let reply = handle_pair_message(&mut cfg, &message, text);
-                send_handled_reply(&client, &cfg.telegram.bot_token, message.chat.id, reply)
-                    .await?;
+                if let Err(err) =
+                    send_handled_reply(&client, &cfg.telegram.bot_token, message.chat.id, reply)
+                        .await
+                {
+                    tracing::warn!(
+                        chat_id = message.chat.id,
+                        error = %redact_telegram_token(&format!("{err:#}")),
+                        "telegram pair reply failed"
+                    );
+                }
                 continue;
             }
             if !allowed(&cfg, &message) {
@@ -139,9 +181,45 @@ pub async fn run_bot(cfg: AppConfig) -> Result<()> {
             }
             let reply =
                 handle_message(&cfg, message.chat.id, text, &mut recoveries, &mut pending).await;
-            send_handled_reply(&client, &cfg.telegram.bot_token, message.chat.id, reply).await?;
+            if let Err(err) =
+                send_handled_reply(&client, &cfg.telegram.bot_token, message.chat.id, reply).await
+            {
+                tracing::warn!(
+                    chat_id = message.chat.id,
+                    error = %redact_telegram_token(&format!("{err:#}")),
+                    "telegram reply failed"
+                );
+            }
         }
     }
+}
+
+async fn get_updates(
+    client: &Client,
+    token: &str,
+    offset: i64,
+) -> Result<TelegramResponse<Vec<Update>>> {
+    client
+        .post(api_url(token, "getUpdates")?)
+        .json(&json!({
+            "timeout": TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS,
+            "offset": offset,
+            "allowed_updates": ["message", "callback_query"]
+        }))
+        .send()
+        .await
+        .context("telegram getUpdates request failed")?
+        .json()
+        .await
+        .context("telegram getUpdates response decode failed")
+}
+
+fn telegram_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECONDS))
+        .pool_max_idle_per_host(0)
+        .build()
+        .context("failed to build telegram HTTP client")
 }
 
 async fn watch_loop(cfg: AppConfig, client: Client) {
@@ -152,7 +230,10 @@ async fn watch_loop(cfg: AppConfig, client: Client) {
         let active_cfg = config::load_or_create().unwrap_or_else(|_| cfg.clone());
         if let Err(err) = watch_once(&active_cfg, &client, &mut recoveries, &mut alerted_keys).await
         {
-            tracing::warn!("watch loop failed: {err:#}");
+            tracing::warn!(
+                error = %redact_telegram_token(&format!("{err:#}")),
+                "watch loop failed"
+            );
         }
         sleep(Duration::from_secs(
             active_cfg.watch.poll_interval_seconds.max(5),
@@ -209,6 +290,14 @@ async fn watch_once(
                 thread_id = %candidate.thread.id,
                 label = %candidate.decision.label,
                 "automatic visible recovery skipped because Accessibility is not granted"
+            );
+            continue;
+        }
+        if !desktop_control::visible_state_ready() {
+            tracing::info!(
+                thread_id = %candidate.thread.id,
+                label = %candidate.decision.label,
+                "automatic visible recovery skipped because Screen Recording is not granted"
             );
             continue;
         }
@@ -276,12 +365,34 @@ async fn handle_message(
         match action {
             PendingAction::ThreadInstruction { thread_id } => {
                 if !trimmed.starts_with('/') && !trimmed.is_empty() {
-                    let turn = codex::continue_thread(&thread_id, trimmed)?;
+                    let response =
+                        control_queue::submit_and_wait(control_queue::ControlAction::Continue {
+                            thread_id: thread_id.clone(),
+                            prompt: trimmed.to_string(),
+                        })?;
                     return Ok(BotReply {
                         text: format!(
-                            "已在 Codex APP 可见窗口发送你的指令\n线程：{thread_id}\nturn：{turn}"
+                            "已在 Codex APP 可见窗口发送你的指令\n线程：{thread_id}\nturn：{turn}",
+                            turn = response.turn_id.unwrap_or_default()
                         ),
                         keyboard: Some(thread_actions_keyboard(&thread_id)),
+                    });
+                }
+            }
+            PendingAction::NewThread => {
+                if !trimmed.starts_with('/') && !trimmed.is_empty() {
+                    let response =
+                        control_queue::submit_and_wait(control_queue::ControlAction::NewThread {
+                            prompt: trimmed.to_string(),
+                            path: default_new_thread_path(),
+                        })?;
+                    return Ok(BotReply {
+                        text: format!(
+                            "已在 Codex APP 内创建新线程\n线程：{}\nturn：{}",
+                            response.thread_id.unwrap_or_else(|| "-".to_string()),
+                            response.turn_id.unwrap_or_default()
+                        ),
+                        keyboard: Some(main_keyboard()),
                     });
                 }
             }
@@ -289,12 +400,29 @@ async fn handle_message(
     }
 
     let mut parts = trimmed.split_whitespace();
-    let command = parts.next().unwrap_or_default();
-    match command {
+    let command = normalize_command_token(parts.next().unwrap_or_default());
+    match command.as_str() {
         "/start" | "/help" | "/menu" | "menu" | "菜单" => main_menu_reply(),
         "/status" | "status" | "状态" => status_reply(cfg),
         "/threads" | "threads" | "线程" => thread_list_reply(),
         "/recoverable" | "recoverable" | "待恢复" => recoverable_reply(),
+        "/new" | "new" | "新线程" => {
+            let prompt = parts.collect::<Vec<_>>().join(" ");
+            if prompt.trim().is_empty() {
+                pending.insert(chat_id, PendingAction::NewThread);
+                Ok(BotReply {
+                    text: "下一条消息会作为新线程的首条指令发送到 Codex APP。".to_string(),
+                    keyboard: Some(json!({
+                        "inline_keyboard": [
+                            [{"text": "取消", "callback_data": "cancel"}],
+                            [{"text": "返回主菜单", "callback_data": "menu"}]
+                        ]
+                    })),
+                })
+            } else {
+                start_new_thread_reply(&prompt).await
+            }
+        }
         "/push_test" | "push_test" | "测试推送" => Ok(BotReply {
             text: "Codex Sentinel 推送通道正常。".to_string(),
             keyboard: Some(main_keyboard()),
@@ -317,8 +445,21 @@ async fn handle_message(
                         .map(|t| t.id.clone())
                 })
                 .context("没有指定线程，也没有最近线程")?;
-            continue_thread_reply(cfg, &thread_id).await
+            let prompt = parts.collect::<Vec<_>>().join(" ");
+            if prompt.trim().is_empty() {
+                continue_thread_reply(cfg, &thread_id).await
+            } else {
+                continue_thread_with_prompt_reply(&thread_id, &prompt).await
+            }
         }
+        "/archive" | "archive" | "归档" | "/delete" | "delete" | "删除" => {
+            let thread_id = parts
+                .next()
+                .map(str::to_string)
+                .context("请提供线程 ID：/delete <thread_id>")?;
+            archive_thread_reply(&thread_id)
+        }
+        "/clear_archived" | "clear_archived" | "清除归档" => clear_archived_reply(),
         _ => Ok(BotReply {
             text: "选择一个线程查看最后反馈；也可以点“一键继续”或“输入指令”。".to_string(),
             keyboard: Some(main_keyboard()),
@@ -356,7 +497,7 @@ fn handle_pair_message(cfg: &mut AppConfig, message: &Message, text: &str) -> Re
 
     Ok(BotReply {
         text: format!(
-            "配对成功。\nchat_id：{}\nuser_id：{}\n\n现在可以使用 /status、/threads、/continue。在线程详情里可点一键继续或输入指令。",
+            "配对成功。\nchat_id：{}\nuser_id：{}\n\n现在可以使用 /menu、/status、/threads、/new、/continue。在线程详情里可点一键继续或输入指令。",
             message.chat.id,
             message
                 .from
@@ -397,6 +538,18 @@ async fn handle_callback(
             .await
             .map(reply_with_main_keyboard);
     }
+    if data == "new" {
+        pending.insert(chat_id, PendingAction::NewThread);
+        return Ok(BotReply {
+            text: "下一条消息会作为新线程的首条指令发送到 Codex APP。".to_string(),
+            keyboard: Some(json!({
+                "inline_keyboard": [
+                    [{"text": "取消", "callback_data": "cancel"}],
+                    [{"text": "返回主菜单", "callback_data": "menu"}]
+                ]
+            })),
+        });
+    }
     if data == "cancel" {
         pending.remove(&chat_id);
         return main_menu_reply();
@@ -408,6 +561,17 @@ async fn handle_callback(
     if let Some(thread_id) = data.strip_prefix("cont:") {
         pending.remove(&chat_id);
         return continue_thread_reply(cfg, thread_id).await;
+    }
+    if data == "clear_archived" {
+        pending.remove(&chat_id);
+        return clear_archived_reply();
+    }
+    if let Some(thread_id) = data
+        .strip_prefix("archive:")
+        .or_else(|| data.strip_prefix("del:"))
+    {
+        pending.remove(&chat_id);
+        return archive_thread_reply(thread_id);
     }
     if let Some(thread_id) = data.strip_prefix("ask:") {
         pending.insert(
@@ -438,7 +602,7 @@ fn main_menu_reply() -> Result<BotReply> {
         .map(|thread| format!("当前线程：{}\n{}", thread.title, thread.id))
         .unwrap_or_else(|| "当前没有读取到 Codex 线程。".to_string());
     Ok(BotReply {
-        text: format!("{active}\n\n你可以查看最后反馈、选择其他线程，或一键让当前线程继续。"),
+        text: format!("{active}\n\n所有动作都会回到 Codex APP 可见窗口执行。"),
         keyboard: Some(main_keyboard()),
     })
 }
@@ -572,13 +736,20 @@ fn main_keyboard() -> Value {
     let mut rows = Vec::new();
     if let Some(thread_id) = active {
         rows.push(vec![
-            json!({"text": "当前线程反馈", "callback_data": format!("thread:{thread_id}")}),
-            json!({"text": "一键继续", "callback_data": format!("cont:{thread_id}")}),
+            json!({"text": "当前线程", "callback_data": format!("thread:{thread_id}")}),
+            json!({"text": "继续当前", "callback_data": format!("cont:{thread_id}")}),
         ]);
     }
     rows.push(vec![
-        json!({"text": "状态", "callback_data": "status"}),
+        json!({"text": "新线程", "callback_data": "new"}),
         json!({"text": "选择线程", "callback_data": "threads"}),
+    ]);
+    rows.push(vec![
+        json!({"text": "待恢复", "callback_data": "recoverable"}),
+        json!({"text": "状态", "callback_data": "status"}),
+    ]);
+    rows.push(vec![
+        json!({"text": "清除归档", "callback_data": "clear_archived"}),
     ]);
     json!({ "inline_keyboard": rows })
 }
@@ -630,25 +801,76 @@ fn thread_actions_keyboard(thread_id: &str) -> Value {
     json!({
         "inline_keyboard": [
             [
-                {"text": "一键继续", "callback_data": format!("cont:{thread_id}")},
+                {"text": "继续", "callback_data": format!("cont:{thread_id}")},
                 {"text": "输入指令", "callback_data": format!("ask:{thread_id}")}
             ],
             [
                 {"text": "刷新反馈", "callback_data": format!("thread:{thread_id}")},
                 {"text": "线程列表", "callback_data": "threads"}
+            ],
+            [
+                {"text": "删除线程", "callback_data": format!("del:{thread_id}")},
+                {"text": "主菜单", "callback_data": "menu"}
             ]
         ]
     })
 }
 
 async fn continue_thread_reply(cfg: &AppConfig, thread_id: &str) -> Result<BotReply> {
-    let turn = codex::continue_thread(thread_id, &cfg.recovery.continue_prompt)?;
+    continue_thread_with_prompt_reply(thread_id, &cfg.recovery.continue_prompt).await
+}
+
+async fn continue_thread_with_prompt_reply(thread_id: &str, prompt: &str) -> Result<BotReply> {
+    let response = control_queue::submit_and_wait(control_queue::ControlAction::Continue {
+        thread_id: thread_id.to_string(),
+        prompt: prompt.to_string(),
+    })?;
     Ok(BotReply {
         text: format!(
-            "已打开 Codex APP，并在可见输入框发送继续指令\n线程：{thread_id}\nturn：{turn}"
+            "已打开 Codex APP，并在可见输入框发送继续指令\n线程：{thread_id}\nturn：{turn}",
+            turn = response.turn_id.unwrap_or_default()
         ),
         keyboard: Some(thread_actions_keyboard(thread_id)),
     })
+}
+
+async fn start_new_thread_reply(prompt: &str) -> Result<BotReply> {
+    let response = control_queue::submit_and_wait(control_queue::ControlAction::NewThread {
+        prompt: prompt.to_string(),
+        path: default_new_thread_path(),
+    })?;
+    Ok(BotReply {
+        text: format!(
+            "已在 Codex APP 内创建新线程\n线程：{}\nturn：{}",
+            response.thread_id.unwrap_or_else(|| "-".to_string()),
+            response.turn_id.unwrap_or_default()
+        ),
+        keyboard: Some(main_keyboard()),
+    })
+}
+
+fn archive_thread_reply(thread_id: &str) -> Result<BotReply> {
+    let response = control_queue::submit_and_wait(control_queue::ControlAction::ArchiveThread {
+        thread_id: thread_id.to_string(),
+    })?;
+    Ok(BotReply {
+        text: response.message,
+        keyboard: Some(main_keyboard()),
+    })
+}
+
+fn clear_archived_reply() -> Result<BotReply> {
+    let response = control_queue::submit_and_wait(control_queue::ControlAction::ClearArchived)?;
+    Ok(BotReply {
+        text: response.message,
+        keyboard: Some(main_keyboard()),
+    })
+}
+
+fn default_new_thread_path() -> Option<String> {
+    codex::read_recent_threads(1)
+        .ok()
+        .and_then(|threads| threads.first().map(|thread| thread.cwd.clone()))
 }
 
 fn reply_with_main_keyboard(text: String) -> BotReply {
@@ -716,6 +938,33 @@ async fn recover_candidate(
         ));
     }
 
+    if automatic {
+        match desktop_control::inspect_thread_failure_state(&thread.id)? {
+            desktop_control::VisibleThreadFailureState::Failed => {
+                tracing::info!(
+                    thread_id = %thread.id,
+                    label = %decision.label,
+                    "visible Codex error marker confirmed before automatic recovery"
+                );
+            }
+            desktop_control::VisibleThreadFailureState::StoppedMarker => {
+                tracing::info!(
+                    thread_id = %thread.id,
+                    label = %decision.label,
+                    "visible Codex stopped marker confirmed with terminal recovery event before automatic recovery"
+                );
+            }
+            desktop_control::VisibleThreadFailureState::NotFailed => {
+                tracing::info!(
+                    thread_id = %thread.id,
+                    label = %decision.label,
+                    "automatic recovery skipped because Codex UI does not show a failure or stopped marker"
+                );
+                return Ok(String::new());
+            }
+        }
+    }
+
     if decision.delay_seconds > 0 {
         sleep(Duration::from_secs(decision.delay_seconds.min(5))).await;
     }
@@ -726,8 +975,12 @@ async fn recover_candidate(
         label = %decision.label,
         "sending recovery continue prompt"
     );
-    let turn = codex::continue_thread(&thread.id, &prompt)?;
+    let response = control_queue::submit_and_wait(control_queue::ControlAction::Continue {
+        thread_id: thread.id.clone(),
+        prompt,
+    })?;
     counter.record(event_key);
+    let turn = response.turn_id.unwrap_or_default();
     tracing::info!(
         thread_id = %thread.id,
         turn_id = %turn,
@@ -851,53 +1104,93 @@ async fn send_message(
     text: &str,
     keyboard: Option<Value>,
 ) -> Result<()> {
-    let url = api_url(token, "sendMessage");
     let mut body = json!({"chat_id": chat_id, "text": truncate(text, 3800)});
     if let Some(keyboard) = keyboard {
         body["reply_markup"] = keyboard;
     }
-    let resp: TelegramResponse<Value> = client.post(url).json(&body).send().await?.json().await?;
+    let resp: TelegramResponse<Value> = client
+        .post(api_url(token, "sendMessage")?)
+        .json(&body)
+        .send()
+        .await
+        .context("telegram sendMessage request failed")?
+        .json()
+        .await
+        .context("telegram sendMessage response decode failed")?;
     if resp.ok {
         Ok(())
     } else {
-        Err(anyhow!("telegram sendMessage failed"))
+        Err(anyhow!(
+            "{}",
+            resp.description
+                .unwrap_or_else(|| "telegram sendMessage returned ok=false".to_string())
+        ))
     }
 }
 
 async fn answer_callback_query(client: &Client, token: &str, callback_id: &str) -> Result<()> {
-    let url = api_url(token, "answerCallbackQuery");
-    let _resp: TelegramResponse<Value> = client
-        .post(url)
+    let resp: TelegramResponse<Value> = client
+        .post(api_url(token, "answerCallbackQuery")?)
         .json(&json!({"callback_query_id": callback_id}))
         .send()
-        .await?
+        .await
+        .context("telegram answerCallbackQuery request failed")?
         .json()
-        .await?;
-    Ok(())
+        .await
+        .context("telegram answerCallbackQuery response decode failed")?;
+    if resp.ok {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{}",
+            resp.description
+                .unwrap_or_else(|| "telegram answerCallbackQuery returned ok=false".to_string())
+        ))
+    }
 }
 
-fn api_url(token: &str, method: &str) -> String {
-    format!("https://api.telegram.org/bot{token}/{method}")
+fn api_url(token: &str, method: &str) -> Result<Url> {
+    Url::parse(&format!("https://api.telegram.org/bot{token}/{method}"))
+        .context("failed to build telegram API URL")
+}
+
+fn redact_telegram_token(text: &str) -> String {
+    let token = config::load_or_create()
+        .map(|cfg| cfg.telegram.bot_token)
+        .unwrap_or_default();
+    if token.trim().is_empty() {
+        return text.to_string();
+    }
+    text.replace(&format!("bot{}", token.trim()), "bot<redacted-token>")
 }
 
 fn is_pair_command(text: &str) -> bool {
     let mut parts = text.trim().split_whitespace();
-    parts.next().is_some_and(|command| {
-        command.eq_ignore_ascii_case("/pair") || command.to_ascii_lowercase().starts_with("/pair@")
-    })
+    parts
+        .next()
+        .is_some_and(|command| normalize_command_token(command) == "/pair")
 }
 
 fn pair_text_matches(text: &str, code: &str) -> bool {
-    let text = text.trim().to_ascii_uppercase();
-    let code = code.trim().to_ascii_uppercase();
-    if text == code {
+    let trimmed = text.trim();
+    let code = code.trim();
+    if trimmed.eq_ignore_ascii_case(code) {
         return true;
     }
-    let mut parts = text.split_whitespace();
+    let mut parts = trimmed.split_whitespace();
     parts
         .next()
-        .is_some_and(|command| command == "/PAIR" || command.starts_with("/PAIR@"))
-        && parts.any(|part| part.trim() == code)
+        .is_some_and(|command| normalize_command_token(command) == "/pair")
+        && parts.any(|part| part.trim().eq_ignore_ascii_case(code))
+}
+
+fn normalize_command_token(command: &str) -> String {
+    command
+        .trim()
+        .split_once('@')
+        .map(|(base, _)| base)
+        .unwrap_or(command.trim())
+        .to_ascii_lowercase()
 }
 
 fn push_unique(ids: &mut Vec<i64>, id: i64) {
@@ -917,4 +1210,26 @@ fn truncate(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}...", &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_group_commands_with_bot_suffix() {
+        assert_eq!(normalize_command_token("/status@codexbot"), "/status");
+        assert_eq!(normalize_command_token("/THREADS@CodexBot"), "/threads");
+    }
+
+    #[test]
+    fn pair_command_matches_with_bot_suffix() {
+        assert!(is_pair_command("/pair@codexbot 123456"));
+        assert!(pair_text_matches("/pair@codexbot 123456", "123456"));
+    }
+
+    #[test]
+    fn pair_text_matches_plain_code() {
+        assert!(pair_text_matches("123456", "123456"));
+    }
 }

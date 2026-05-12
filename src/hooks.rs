@@ -1,10 +1,10 @@
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -16,6 +16,11 @@ const SENTINEL_MARKER: &str = "codex-sentinel";
 const STOP_TIMEOUT_SECONDS: u64 = 240;
 const STOP_LOG_LOOKBACK_SECONDS: i64 = 300;
 const STOP_LOG_LOOKBACK_WITH_TURN_SECONDS: i64 = 1800;
+const STOP_HOOK_MAX_INLINE_DELAY_SECONDS: u64 = 10;
+const STOP_HOOK_DEDUP_WINDOW_SECONDS: i64 = 300;
+const RECENT_HOOK_EVENT_LIMIT: usize = 5;
+const INSTALLED_APP_EXECUTABLE: &str =
+    "/Applications/Codex Sentinel.app/Contents/MacOS/codex-sentinel";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookStatus {
@@ -24,8 +29,10 @@ pub struct HookStatus {
     pub hooks_path: String,
     pub hooks_file_exists: bool,
     pub stop_installed: bool,
+    pub installed_app_command: bool,
     pub current_executable: String,
     pub installed_commands: Vec<String>,
+    pub recent_events: Vec<HookEventSummary>,
     pub notes: Vec<String>,
 }
 
@@ -46,6 +53,35 @@ struct HookInput {
     turn_id: Option<String>,
     stop_hook_active: Option<bool>,
     last_assistant_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookEventSummary {
+    pub ts: DateTime<Utc>,
+    pub event: Option<String>,
+    pub action: String,
+    pub event_key: String,
+    pub source: String,
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub delay_seconds: u64,
+    pub decision_label: String,
+    pub decision_kind: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HookEventLine {
+    ts: DateTime<Utc>,
+    event: Option<String>,
+    action: String,
+    event_key: String,
+    source: Option<String>,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    delay_seconds: Option<u64>,
+    decision: Option<RecoveryDecision>,
+    body: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +118,7 @@ pub fn inspect_hooks() -> Result<HookStatus> {
     let hooks_file_exists = hooks_path.exists();
     let mut installed_commands = Vec::new();
     let mut stop_installed = false;
+    let mut installed_app_command = false;
 
     if hooks_file_exists {
         let raw = fs::read_to_string(&hooks_path)
@@ -90,6 +127,7 @@ pub fn inspect_hooks() -> Result<HookStatus> {
             .with_context(|| format!("failed to parse {}", hooks_path.display()))?;
         installed_commands = collect_sentinel_commands(&value);
         stop_installed = event_has_sentinel_command(&value, "Stop");
+        installed_app_command = installed_app_command_present(&installed_commands);
     }
 
     let mut notes = Vec::new();
@@ -101,14 +139,21 @@ pub fn inspect_hooks() -> Result<HookStatus> {
     if !stop_installed {
         notes.push("Stop hook 未安装，Codex Sentinel 无法在任务停止事件里自动续跑。".to_string());
     }
+    if stop_installed && !installed_app_command {
+        notes.push(format!(
+            "Stop hook 当前没有指向已安装包：{INSTALLED_APP_EXECUTABLE}。请从 /Applications 安装或修复 Hook。"
+        ));
+    }
     Ok(HookStatus {
         feature_enabled,
         config_path: config_path.display().to_string(),
         hooks_path: hooks_path.display().to_string(),
         hooks_file_exists,
         stop_installed,
+        installed_app_command,
         current_executable,
         installed_commands,
+        recent_events: recent_hook_events(RECENT_HOOK_EVENT_LIMIT).unwrap_or_default(),
         notes,
     })
 }
@@ -156,16 +201,24 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
     let input = read_hook_input()?;
     let cfg = config::load_or_create().unwrap_or_default();
     let classification = classify_stop_input(&input);
+    let body_hash = stable_hash_hex(&[&classification.body]);
+    let event_key = stop_event_key(&input, &classification, &body_hash);
+    let duplicate = recent_event_with_key(&event_key, STOP_HOOK_DEDUP_WINDOW_SECONDS)
+        .unwrap_or(None)
+        .is_some();
     let response = stop_hook_response(
         &input,
         &cfg,
         &classification.decision,
         should_sleep_in_hook(),
+        duplicate,
     )?;
-    let action = stop_hook_action(&input, &cfg, &classification.decision);
+    let action = stop_hook_action(&input, &cfg, &classification.decision, duplicate);
 
     if should_log_stop_event(&classification, action) {
-        if let Err(err) = log_stop_hook_event(&input, &classification, action) {
+        if let Err(err) =
+            log_stop_hook_event(&input, &classification, action, &body_hash, &event_key)
+        {
             tracing::warn!("failed to write Stop hook event: {err:#}");
         }
     }
@@ -175,7 +228,7 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
 
 fn classify_stop_input(input: &HookInput) -> StopClassification {
     let message = input.last_assistant_message.as_deref().unwrap_or_default();
-    let decision = classify_error(message);
+    let decision = classify_stop_assistant_text(message);
     if decision.kind != RecoveryKind::None {
         return stop_classification(input, decision, "last_assistant_message", message);
     }
@@ -192,7 +245,7 @@ fn classify_stop_input(input: &HookInput) -> StopClassification {
     }
 
     if let Some(transcript_message) = transcript_message.as_deref() {
-        let transcript_decision = classify_error(transcript_message);
+        let transcript_decision = classify_stop_assistant_text(transcript_message);
         if transcript_decision.kind != RecoveryKind::None {
             return stop_classification(
                 input,
@@ -214,6 +267,14 @@ fn classify_stop_input(input: &HookInput) -> StopClassification {
     }
 
     stop_classification(input, decision, "empty", message)
+}
+
+fn classify_stop_assistant_text(text: &str) -> RecoveryDecision {
+    let decision = classify_error(text);
+    if decision.label == "Silent turn completion" {
+        return RecoveryDecision::none();
+    }
+    decision
 }
 
 fn classify_stop_from_log(
@@ -314,6 +375,7 @@ fn stop_hook_response(
     cfg: &AppConfig,
     decision: &RecoveryDecision,
     allow_sleep: bool,
+    duplicate: bool,
 ) -> Result<Value> {
     if input.stop_hook_active.unwrap_or(false) {
         return Ok(json!({
@@ -326,6 +388,13 @@ fn stop_hook_response(
         return Ok(json!({ "continue": true }));
     }
 
+    if duplicate {
+        return Ok(json!({
+            "continue": false,
+            "systemMessage": format!("Codex Sentinel 已在最近 {}s 内处理过同一个 Stop 事件，本次交给 watcher、Telegram 或桌面面板继续观察。", STOP_HOOK_DEDUP_WINDOW_SECONDS)
+        }));
+    }
+
     if !cfg.recovery.auto_recover || !decision.auto_allowed {
         return Ok(json!({
             "continue": false,
@@ -334,10 +403,10 @@ fn stop_hook_response(
     }
 
     if decision.delay_seconds > 0 {
-        if decision.delay_seconds > STOP_TIMEOUT_SECONDS.saturating_sub(20) {
+        if decision.delay_seconds > STOP_HOOK_MAX_INLINE_DELAY_SECONDS {
             return Ok(json!({
                 "continue": false,
-                "systemMessage": format!("Codex Sentinel 检测到「{}」，但安全退避为 {}s，超过 Stop hook 超时预算。请稍后通过 Telegram 或桌面端恢复。", decision.label, decision.delay_seconds)
+                "systemMessage": format!("Codex Sentinel 检测到「{}」，但退避为 {}s；Stop hook 不在行内长时间等待，已交给 watcher、Telegram 或桌面面板稍后恢复。", decision.label, decision.delay_seconds)
             }));
         }
         if allow_sleep {
@@ -606,16 +675,21 @@ fn stop_hook_action(
     input: &HookInput,
     cfg: &AppConfig,
     decision: &RecoveryDecision,
+    duplicate: bool,
 ) -> &'static str {
     if input.stop_hook_active.unwrap_or(false) {
         "loop_prevented"
     } else if decision.kind == RecoveryKind::None {
         "none"
+    } else if duplicate {
+        "deduped"
     } else if !cfg.recovery.auto_recover || !decision.auto_allowed {
         match decision.kind {
             RecoveryKind::Reauth => "manual_reauth",
             _ => "manual",
         }
+    } else if decision.delay_seconds > STOP_HOOK_MAX_INLINE_DELAY_SECONDS {
+        "deferred"
     } else {
         "continue"
     }
@@ -631,13 +705,14 @@ fn log_stop_hook_event(
     input: &HookInput,
     classification: &StopClassification,
     action: &str,
+    body_hash: &str,
+    event_key: &str,
 ) -> Result<()> {
-    let body_hash = stable_hash_hex(&[&classification.body]);
     let line = json!({
         "ts": Utc::now(),
         "event": &input.hook_event_name,
         "action": action,
-        "event_key": stop_event_key(input, classification, &body_hash),
+        "event_key": event_key,
         "source": &classification.source,
         "session_id": &input.session_id,
         "turn_id": &input.turn_id,
@@ -692,7 +767,7 @@ fn stable_hash_hex(parts: &[&str]) -> String {
 fn append_hook_event(line: &Value) -> Result<()> {
     let dir = config::config_dir();
     fs::create_dir_all(&dir)?;
-    let path = dir.join("hook-events.jsonl");
+    let path = hook_events_path();
     let mut raw = serde_json::to_string(&line)?;
     raw.push('\n');
     fs::OpenOptions::new()
@@ -701,6 +776,90 @@ fn append_hook_event(line: &Value) -> Result<()> {
         .open(path)?
         .write_all(raw.as_bytes())?;
     Ok(())
+}
+
+fn hook_events_path() -> PathBuf {
+    config::config_dir().join("hook-events.jsonl")
+}
+
+pub fn recent_hook_events(limit: usize) -> Result<Vec<HookEventSummary>> {
+    let path = hook_events_path();
+    recent_hook_events_from_path(&path, limit)
+}
+
+fn recent_hook_events_from_path(path: &Path, limit: usize) -> Result<Vec<HookEventSummary>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path)?;
+    let mut events = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<HookEventLine>(trimmed) {
+            events.push(event);
+        }
+    }
+    events.sort_by_key(|event| event.ts);
+    events.reverse();
+    Ok(events
+        .into_iter()
+        .take(limit)
+        .map(HookEventSummary::from)
+        .collect())
+}
+
+fn recent_event_with_key(key: &str, max_age_seconds: i64) -> Result<Option<HookEventSummary>> {
+    recent_event_with_key_from_events(recent_hook_events(64)?, key, max_age_seconds, Utc::now())
+}
+
+fn recent_event_with_key_from_events(
+    events: Vec<HookEventSummary>,
+    key: &str,
+    max_age_seconds: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<HookEventSummary>> {
+    Ok(events.into_iter().find(|event| {
+        event.event_key == key
+            && now.signed_duration_since(event.ts).num_seconds() <= max_age_seconds
+    }))
+}
+
+impl From<HookEventLine> for HookEventSummary {
+    fn from(event: HookEventLine) -> Self {
+        let decision_label = event
+            .decision
+            .as_ref()
+            .map(|decision| decision.label.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let decision_kind = event
+            .decision
+            .as_ref()
+            .map(|decision| format!("{:?}", decision.kind))
+            .unwrap_or_else(|| "-".to_string());
+        Self {
+            ts: event.ts,
+            event: event.event,
+            action: event.action,
+            event_key: event.event_key,
+            source: event.source.unwrap_or_else(|| "-".to_string()),
+            session_id: event.session_id,
+            turn_id: event.turn_id,
+            delay_seconds: event.delay_seconds.unwrap_or(0),
+            decision_label,
+            decision_kind,
+            body: truncate(&event.body.unwrap_or_default(), 280),
+        }
+    }
+}
+
+fn installed_app_command_present(commands: &[String]) -> bool {
+    commands
+        .iter()
+        .any(|command| command.contains(INSTALLED_APP_EXECUTABLE))
 }
 
 fn print_json(value: &Value) -> Result<()> {
@@ -723,6 +882,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn stop_hook_does_not_fallback_after_normal_assistant_message() {
@@ -743,6 +903,26 @@ mod tests {
     }
 
     #[test]
+    fn stop_hook_ignores_silent_completion_phrase_in_final_assistant_message() {
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: Some("thread".to_string()),
+            transcript_path: None,
+            cwd: None,
+            model: None,
+            turn_id: Some("turn".to_string()),
+            stop_hook_active: Some(false),
+            last_assistant_message: Some(
+                "根因是 app-server completed/error:null 压掉了 completed without a final assistant message 这个异常信号，已修复并验证。".to_string(),
+            ),
+        };
+        let classification = classify_stop_input(&input);
+
+        assert_eq!(classification.decision.kind, RecoveryKind::None);
+        assert_eq!(classification.source, "last_assistant_message");
+    }
+
+    #[test]
     fn safety_stop_hook_prompt_does_not_echo_trigger_terms() {
         let mut cfg = AppConfig::default();
         cfg.recovery.safety_rephrase_prompt = "继续干。possible cybersecurity risk / try rephrasing your request / Trusted Access for Cyber / https://chatgpt.com/cyber".to_string();
@@ -759,7 +939,7 @@ mod tests {
             ),
         };
         let decision = classify_error(input.last_assistant_message.as_deref().unwrap());
-        let response = stop_hook_response(&input, &cfg, &decision, false).unwrap();
+        let response = stop_hook_response(&input, &cfg, &decision, false, false).unwrap();
         let reason = response
             .get("reason")
             .and_then(Value::as_str)
@@ -796,6 +976,178 @@ mod tests {
 
         assert!(should_prefer_log_fallback(&with_turn));
         assert!(!should_prefer_log_fallback(&without_turn));
+    }
+
+    #[test]
+    fn parses_realistic_codex_stop_payload_variants() {
+        let payload = include_str!("../tests/fixtures/hook_stop_full_payload.json");
+        let input: HookInput = serde_json::from_str(payload).unwrap();
+        let classification = classify_stop_input(&input);
+
+        assert_eq!(input.hook_event_name.as_deref(), Some("Stop"));
+        assert_eq!(input.cwd.as_deref(), Some("/Users/gosu/Documents"));
+        assert_eq!(classification.decision.kind, RecoveryKind::RetrySoon);
+        assert_eq!(classification.source, "last_assistant_message");
+
+        let minimal_payload = include_str!("../tests/fixtures/hook_stop_minimal_payload.json");
+        let minimal: HookInput = serde_json::from_str(minimal_payload).unwrap();
+        let minimal_classification = classify_stop_input(&minimal);
+
+        assert_eq!(minimal.turn_id, None);
+        assert_eq!(minimal_classification.decision.kind, RecoveryKind::None);
+    }
+
+    #[test]
+    fn duplicate_stop_hook_is_suppressed() {
+        let cfg = AppConfig::default();
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: Some("thread".to_string()),
+            transcript_path: None,
+            cwd: None,
+            model: None,
+            turn_id: Some("turn".to_string()),
+            stop_hook_active: Some(false),
+            last_assistant_message: Some("Turn error: 503 Service Unavailable".to_string()),
+        };
+        let decision = classify_error(input.last_assistant_message.as_deref().unwrap());
+        let response = stop_hook_response(&input, &cfg, &decision, false, true).unwrap();
+
+        assert_eq!(
+            response.get("continue").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            response
+                .get("systemMessage")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("同一个 Stop 事件")
+        );
+        assert_eq!(stop_hook_action(&input, &cfg, &decision, true), "deduped");
+    }
+
+    #[test]
+    fn long_delay_is_deferred_outside_stop_hook() {
+        let cfg = AppConfig::default();
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: Some("thread".to_string()),
+            transcript_path: None,
+            cwd: None,
+            model: None,
+            turn_id: Some("turn".to_string()),
+            stop_hook_active: Some(false),
+            last_assistant_message: None,
+        };
+        let decision = RecoveryDecision {
+            kind: RecoveryKind::RetryLater,
+            auto_allowed: true,
+            delay_seconds: STOP_HOOK_MAX_INLINE_DELAY_SECONDS + 1,
+            label: "Long backoff".to_string(),
+            reason: "wait longer outside the Stop hook".to_string(),
+        };
+        let response = stop_hook_response(&input, &cfg, &decision, false, false).unwrap();
+
+        assert_eq!(
+            response.get("continue").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            response
+                .get("systemMessage")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("不在行内长时间等待")
+        );
+        assert_eq!(stop_hook_action(&input, &cfg, &decision, false), "deferred");
+    }
+
+    #[test]
+    fn recent_hook_events_parse_and_dedupe_by_age() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-sentinel-hook-events-{}.jsonl",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let old_ts = Utc.with_ymd_and_hms(2026, 5, 12, 0, 0, 0).unwrap();
+        let new_ts = Utc.with_ymd_and_hms(2026, 5, 12, 0, 4, 0).unwrap();
+        let decision = RecoveryDecision {
+            kind: RecoveryKind::RetrySoon,
+            auto_allowed: true,
+            delay_seconds: 3,
+            label: "Temporary upstream failure".to_string(),
+            reason: "transient".to_string(),
+        };
+        let older = json!({
+            "ts": old_ts,
+            "event": "Stop",
+            "action": "continue",
+            "event_key": "same-key",
+            "source": "last_assistant_message",
+            "session_id": "thread",
+            "turn_id": "turn",
+            "delay_seconds": 3,
+            "decision": decision,
+            "body": "old event"
+        });
+        let newer = json!({
+            "ts": new_ts,
+            "event": "Stop",
+            "action": "deduped",
+            "event_key": "same-key",
+            "source": "last_assistant_message",
+            "session_id": "thread",
+            "turn_id": "turn",
+            "delay_seconds": 3,
+            "decision": decision,
+            "body": "new event"
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\nnot-json\n{}\n",
+                serde_json::to_string(&older).unwrap(),
+                serde_json::to_string(&newer).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let events = recent_hook_events_from_path(&path, 8).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].action, "deduped");
+        assert_eq!(events[0].decision_kind, "RetrySoon");
+        assert!(events[0].body.contains("new event"));
+
+        let duplicate = recent_event_with_key_from_events(
+            events.clone(),
+            "same-key",
+            300,
+            Utc.with_ymd_and_hms(2026, 5, 12, 0, 4, 30).unwrap(),
+        )
+        .unwrap();
+        assert!(duplicate.is_some());
+
+        let stale = recent_event_with_key_from_events(
+            events,
+            "same-key",
+            10,
+            Utc.with_ymd_and_hms(2026, 5, 12, 0, 4, 30).unwrap(),
+        )
+        .unwrap();
+        assert!(stale.is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn installed_hook_command_must_point_to_app_bundle() {
+        assert!(installed_app_command_present(&[format!(
+            "\"{INSTALLED_APP_EXECUTABLE}\" hook-stop"
+        )]));
+        assert!(!installed_app_command_present(&[
+            "\"/Users/gosu/Documents/codex-sentinel-work/target/debug/codex-sentinel\" hook-stop"
+                .to_string()
+        ]));
     }
 
     #[test]

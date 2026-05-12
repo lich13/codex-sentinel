@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "019e1638-252e-7632-9630-530023eafc58",
+  "transcript_path": "/Users/gosu/.codex/sessions/2026/05/11/rollout-demo.jsonl",
+  "cwd": "/Users/gosu/Documents",
+  "model": "gpt-5.5",
+  "turn_id": "019e1638-252e-7632-9630-530023eafc58",
+  "stop_hook_active": false,
+  "last_assistant_message": "Turn error: unexpected status 503 Service Unavailable"
+}

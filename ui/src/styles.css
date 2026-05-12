@@ -149,6 +149,12 @@ button:active {
   border: 1px solid var(--line);
 }
 
+.secondary.danger-soft {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: rgba(180, 35, 24, 0.18);
+}
+
 .ghost {
   color: var(--accent);
   background: var(--accent-soft);
@@ -433,6 +439,7 @@ dd {
 }
 
 .hook-steps,
+.hook-event-list,
 .thread-list,
 .log-stack,
 .form-grid {
@@ -448,6 +455,17 @@ dd {
   padding: 10px;
 }
 
+.hook-compact {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  min-height: 34px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+
 .hook-step > span {
   display: grid;
   width: 22px;
@@ -460,7 +478,24 @@ dd {
   font-weight: 900;
 }
 
+.hook-compact > span {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  place-items: center;
+  border-radius: 999px;
+  color: #ffffff;
+  background: var(--danger);
+  font-size: 11px;
+  font-weight: 900;
+}
+
 .hook-step.ok > span {
+  background: var(--accent);
+}
+
+.hook-compact.ok > span {
   background: var(--accent);
 }
 
@@ -469,8 +504,22 @@ dd {
   background: #e8ebf1;
 }
 
+.hook-compact.optional > span {
+  color: #475467;
+  background: #e8ebf1;
+}
+
 .hook-step.optional strong {
   color: #475467;
+}
+
+.hook-compact.optional strong {
+  color: #475467;
+}
+
+.hook-compact strong {
+  color: var(--ink);
+  font-size: 12px;
 }
 
 .hook-step strong,
@@ -486,6 +535,99 @@ dd {
   margin-top: 3px;
   color: var(--muted);
   font-size: 11px;
+  word-break: break-all;
+}
+
+.hook-event-list {
+  margin-top: 10px;
+}
+
+.hook-summary {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.hook-summary > div {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+
+.hook-summary strong,
+.hook-summary span {
+  display: block;
+}
+
+.hook-summary strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.hook-summary span {
+  overflow: hidden;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hook-diagnostics .hook-steps {
+  padding: 0 12px;
+}
+
+.hook-diagnostics .hook-event-list {
+  padding: 0 12px 12px;
+}
+
+.hook-event {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+
+.hook-event.ok {
+  border-color: rgba(15, 118, 110, 0.18);
+  background: var(--accent-soft);
+}
+
+.hook-event.warn {
+  border-color: rgba(180, 83, 9, 0.22);
+  background: var(--warn-soft);
+}
+
+.hook-event.bad {
+  border-color: rgba(180, 35, 24, 0.18);
+  background: var(--danger-soft);
+}
+
+.hook-event strong,
+.hook-event span,
+.hook-event small {
+  display: block;
+}
+
+.hook-event strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.hook-event span,
+.hook-event small,
+.hook-event p {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.hook-event small,
+.hook-event p {
   word-break: break-all;
 }
 
@@ -515,6 +657,9 @@ dd {
 }
 
 .form-grid input[type="password"],
+.form-grid input[type="text"],
+.form-grid input[type="number"],
+.new-thread-box input[type="text"],
 .form-grid textarea {
   width: 100%;
   border: 1px solid var(--line);
@@ -528,6 +673,9 @@ dd {
 }
 
 .form-grid input[type="password"]:focus,
+.form-grid input[type="text"]:focus,
+.form-grid input[type="number"]:focus,
+.new-thread-box input[type="text"]:focus,
 .form-grid textarea:focus {
   border-color: rgba(15, 118, 110, 0.55);
   box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.1);
@@ -613,9 +761,72 @@ dd {
 
 .thread-row {
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 12px;
+  gap: 10px;
   padding: 10px;
+}
+
+.thread-main {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  align-items: start;
+}
+
+.thread-main small {
+  display: block;
+  margin-top: 3px;
+  color: var(--subtle);
+  font: 11px/1.35 "SF Mono", Menlo, monospace;
+  word-break: break-all;
+}
+
+.thread-command,
+.new-thread-box {
+  display: grid;
+  gap: 8px;
+}
+
+.thread-command {
+  grid-template-columns: 1fr auto;
+  align-items: end;
+}
+
+.thread-command textarea,
+.new-thread-box textarea {
+  width: 100%;
+  min-height: 58px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 10px;
+  resize: vertical;
+  color: var(--ink);
+  background: #ffffff;
+  font: 12px/1.45 "SF Mono", Menlo, "PingFang SC", monospace;
+}
+
+.new-thread-box {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid rgba(15, 118, 110, 0.18);
+  border-radius: 12px;
+  background: var(--accent-soft);
+}
+
+.new-thread-box label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.tiny-danger {
+  min-height: 28px;
+  padding: 7px 9px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid rgba(180, 35, 24, 0.18);
+  font-size: 12px;
 }
 
 .recoverable-list {
@@ -641,6 +852,7 @@ dd {
 
 .thread-row strong,
 .thread-row span,
+.thread-main time,
 .recoverable-row strong,
 .recoverable-row span,
 .recoverable-row b,
@@ -654,7 +866,7 @@ dd {
 }
 
 .thread-row span,
-.thread-row time,
+.thread-main time,
 .recoverable-row span,
 .recoverable-row time,
 .timestamp {
@@ -769,5 +981,10 @@ pre {
   .config-list.compact div {
     grid-template-columns: 1fr;
     gap: 3px;
+  }
+
+  .thread-main,
+  .thread-command {
+    grid-template-columns: 1fr;
   }
 }

@@ -70,6 +70,19 @@ pub fn classify_error(text: &str) -> RecoveryDecision {
         };
     }
 
+    if lower.contains("codex app-server reported terminal thread status")
+        || lower.contains("codex app-server reported terminal turn status")
+    {
+        return RecoveryDecision {
+            kind: RecoveryKind::RetrySoon,
+            auto_allowed: true,
+            delay_seconds: 0,
+            label: "Codex terminal status".to_string(),
+            reason: "Codex app-server 已确认线程或 turn 处于终止错误状态；可交给可见窗口恢复。"
+                .to_string(),
+        };
+    }
+
     if lower.contains("this content was flagged for possible cybersecurity risk")
         || (lower.contains("possible cybersecurity risk") && lower.contains("try rephrasing"))
         || lower.contains("trusted access for cyber")

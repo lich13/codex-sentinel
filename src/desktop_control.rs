@@ -1,8 +1,20 @@
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+#[cfg(target_os = "macos")]
+use foreign_types::ForeignType;
+#[cfg(target_os = "macos")]
+use image::GenericImageView;
 use serde::Serialize;
 
 #[cfg(target_os = "macos")]
@@ -16,17 +28,23 @@ use core_foundation::number::CFNumber;
 #[cfg(target_os = "macos")]
 use core_foundation::string::{CFString, CFStringRef};
 #[cfg(target_os = "macos")]
+use core_graphics::event::EventField;
+#[cfg(target_os = "macos")]
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, KeyCode};
 #[cfg(target_os = "macos")]
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 #[cfg(target_os = "macos")]
 use core_graphics::geometry::CGPoint;
 #[cfg(target_os = "macos")]
+use core_graphics::sys::CGEventRef;
+#[cfg(target_os = "macos")]
 use core_graphics::window::{
     copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer,
-    kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowOwnerName,
-    kCGWindowOwnerPID,
+    kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowNumber,
+    kCGWindowOwnerName, kCGWindowOwnerPID,
 };
+#[cfg(target_os = "macos")]
+use sysinfo::System;
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -38,6 +56,11 @@ unsafe extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGEventKeyboardSetUnicodeString(
+        event: CGEventRef,
+        string_length: libc::size_t,
+        unicode_string: *const u16,
+    );
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,10 +72,17 @@ pub struct DesktopControlStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct VisibleContinueResult {
-    pub thread_id: String,
+pub struct VisibleNewThreadResult {
+    pub thread_id: Option<String>,
     pub turn_id: String,
     pub transport: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibleThreadFailureState {
+    Failed,
+    StoppedMarker,
+    NotFailed,
 }
 
 pub fn inspect() -> DesktopControlStatus {
@@ -101,22 +131,8 @@ pub fn visible_input_ready() -> bool {
     accessibility_enabled()
 }
 
-pub fn continue_thread_visible(thread_id: &str, prompt: &str) -> Result<VisibleContinueResult> {
-    if !accessibility_enabled() {
-        return Err(anyhow!(
-            "缺少辅助功能权限，无法在 Codex APP 可见窗口内发送指令。请在系统设置 -> 隐私与安全性 -> 辅助功能 中允许 Codex Sentinel 后重试。"
-        ));
-    }
-
-    submit_visible_prompt(thread_id, prompt).with_context(|| {
-        format!("failed to submit visible continue prompt to Codex thread {thread_id}")
-    })?;
-
-    Ok(VisibleContinueResult {
-        thread_id: thread_id.to_string(),
-        turn_id: visible_turn_id(),
-        transport: "visible_desktop".to_string(),
-    })
+pub fn visible_state_ready() -> bool {
+    accessibility_enabled() && screen_recording_preflight()
 }
 
 fn accessibility_enabled() -> bool {
@@ -152,19 +168,15 @@ fn open_settings_url(url: &str) -> Result<()> {
     }
 }
 
-fn submit_visible_prompt(thread_id: &str, prompt: &str) -> Result<()> {
+#[cfg(target_os = "macos")]
+pub fn prepare_existing_thread_visible(thread_id: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let previous_clipboard = read_clipboard().ok();
-        let result = submit_visible_prompt_macos(thread_id, prompt);
-        if let Some(previous_clipboard) = previous_clipboard {
-            let _ = write_clipboard(&previous_clipboard);
-        }
-        result
+        open_codex_thread(thread_id)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (thread_id, prompt);
+        let _ = thread_id;
         Err(anyhow!(
             "visible desktop control is only available on macOS"
         ))
@@ -172,20 +184,54 @@ fn submit_visible_prompt(thread_id: &str, prompt: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn submit_visible_prompt_macos(thread_id: &str, prompt: &str) -> Result<()> {
-    open_codex_thread(thread_id)?;
+pub fn inspect_thread_failure_state(thread_id: &str) -> Result<VisibleThreadFailureState> {
+    prepare_existing_thread_visible(thread_id)?;
     let window = wait_for_codex_window(Duration::from_secs(4))?;
-    let click_x = window.x + window.width / 2.0;
-    let click_y = window.y + window.height - 74.0;
+    std::thread::sleep(Duration::from_millis(450));
+    codex_window_thread_failure_state(&window)
+}
 
-    click_at(window.pid, click_x, click_y)?;
-    std::thread::sleep(Duration::from_millis(120));
+#[cfg(not(target_os = "macos"))]
+pub fn inspect_thread_failure_state(thread_id: &str) -> Result<VisibleThreadFailureState> {
+    let _ = thread_id;
+    Err(anyhow!(
+        "visible desktop state inspection is only available on macOS"
+    ))
+}
 
-    write_clipboard(prompt.as_bytes())?;
-    post_command_v(window.pid)?;
-    std::thread::sleep(Duration::from_millis(120));
-    post_key(window.pid, KeyCode::RETURN, false, CGEventFlags::empty())?;
+#[cfg(target_os = "macos")]
+pub fn prepare_new_thread_visible(path: Option<&str>) -> Result<()> {
+    open_codex_new_thread(path)
+}
+
+#[cfg(target_os = "macos")]
+pub fn submit_prompt_to_visible_window(prompt: &str, attempt: usize) -> Result<()> {
+    submit_prompt_to_current_codex_window(prompt, attempt, ComposerPlacement::ExistingThread)
+}
+
+#[cfg(target_os = "macos")]
+pub fn submit_new_thread_prompt_to_visible_window(prompt: &str, attempt: usize) -> Result<()> {
+    submit_prompt_to_current_codex_window(prompt, attempt, ComposerPlacement::NewThread)
+}
+
+#[cfg(target_os = "macos")]
+fn submit_prompt_to_current_codex_window(
+    prompt: &str,
+    attempt: usize,
+    placement: ComposerPlacement,
+) -> Result<()> {
+    let window = wait_for_codex_window(Duration::from_secs(4))?;
+    for point in prompt_focus_points(&window, attempt, placement) {
+        click_at(window.pid, point.x, point.y)?;
+        std::thread::sleep(Duration::from_millis(90));
+    }
     std::thread::sleep(Duration::from_millis(150));
+
+    clear_current_input(window.pid)?;
+    insert_prompt_text(window.pid, prompt, attempt)?;
+    std::thread::sleep(Duration::from_millis(120));
+    trigger_send(&window, attempt, placement)?;
+    std::thread::sleep(Duration::from_millis(360));
     Ok(())
 }
 
@@ -193,6 +239,7 @@ fn submit_visible_prompt_macos(thread_id: &str, prompt: &str) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 struct CodexWindow {
     pid: i32,
+    window_id: i64,
     x: f64,
     y: f64,
     width: f64,
@@ -200,19 +247,118 @@ struct CodexWindow {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+enum ComposerPlacement {
+    ExistingThread,
+    NewThread,
+}
+
+#[cfg(target_os = "macos")]
 fn open_codex_thread(thread_id: &str) -> Result<()> {
     let uri = format!("codex://threads/{thread_id}");
+    open_codex_uri(&uri)?;
+    activate_codex_app()?;
+    std::thread::sleep(Duration::from_millis(1_400));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_codex_new_thread(path: Option<&str>) -> Result<()> {
+    if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) {
+        open_path_with_codex(path)?;
+    } else {
+        open_codex_app()?;
+    }
+    let window = wait_for_codex_window(Duration::from_secs(4))?;
+    if let Err(err) = trigger_codex_new_chat_menu() {
+        tracing::debug!(
+            "Codex New Chat menu command failed, falling back to sidebar and Cmd+N: {err:#}"
+        );
+        click_codex_new_chat_button(&window).or_else(|click_err| {
+            tracing::debug!(
+                "Codex sidebar New Chat click failed, falling back to Cmd+N: {click_err:#}"
+            );
+            post_command_n(window.pid)
+        })?;
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn trigger_codex_new_chat_menu() -> Result<()> {
+    let script = r#"tell application "Codex" to activate
+    delay 0.15
+    tell application "System Events"
+        tell process "Codex"
+            tell menu bar 1
+                tell menu bar item "File"
+                    tell menu 1
+                        click menu item "New Chat"
+                    end tell
+                end tell
+            end tell
+        end tell
+    end tell"#;
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .status()
+        .context("failed to run Codex New Chat menu command")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("Codex New Chat menu command failed with {status}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_codex_uri(uri: &str) -> Result<()> {
     let status = Command::new("open")
-        .arg(&uri)
+        .arg(uri)
         .status()
         .with_context(|| format!("failed to open {uri}"))?;
     if !status.success() {
         return Err(anyhow!("open {uri} failed with {status}"));
     }
-    std::thread::sleep(Duration::from_millis(900));
+    Ok(())
+}
 
-    let _ = Command::new("open").args(["-a", "Codex"]).status();
-    std::thread::sleep(Duration::from_millis(250));
+#[cfg(target_os = "macos")]
+fn activate_codex_app() -> Result<()> {
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(r#"tell application "Codex" to activate"#)
+        .status()
+        .context("failed to activate Codex")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("activate Codex failed with {status}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_path_with_codex(path: &str) -> Result<()> {
+    let status = Command::new("open")
+        .args(["-g", "-a", "Codex", path])
+        .status()
+        .with_context(|| format!("failed to open {path} with Codex"))?;
+    if !status.success() {
+        return Err(anyhow!("open -a Codex {path} failed with {status}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_codex_app() -> Result<()> {
+    let status = Command::new("open")
+        .args(["-g", "-a", "Codex"])
+        .status()
+        .context("failed to open Codex")?;
+    if !status.success() {
+        return Err(anyhow!("open -a Codex failed with {status}"));
+    }
     Ok(())
 }
 
@@ -236,6 +382,7 @@ fn wait_for_codex_window(timeout: Duration) -> Result<CodexWindow> {
 fn find_codex_window() -> Option<CodexWindow> {
     let option = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
     let windows = copy_window_info(option, kCGNullWindowID)?;
+    let codex_pids = codex_main_pids();
     for raw_value in windows.get_all_values() {
         let value = unsafe { CFType::wrap_under_get_rule(raw_value as _) };
         let Some(untyped_dict) = value.downcast::<CFDictionary>() else {
@@ -250,12 +397,17 @@ fn find_codex_window() -> Option<CodexWindow> {
             continue;
         }
         let pid = dict_i64(&dict, unsafe { kCGWindowOwnerPID })? as i32;
+        if !codex_pids.is_empty() && !codex_pids.contains(&pid) {
+            continue;
+        }
+        let window_id = dict_i64(&dict, unsafe { kCGWindowNumber })?;
         let bounds = dict_bounds(&dict)?;
         if bounds.width < 320.0 || bounds.height < 240.0 {
             continue;
         }
         return Some(CodexWindow {
             pid,
+            window_id,
             x: bounds.x,
             y: bounds.y,
             width: bounds.width,
@@ -263,6 +415,310 @@ fn find_codex_window() -> Option<CodexWindow> {
         });
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn codex_window_thread_failure_state(window: &CodexWindow) -> Result<VisibleThreadFailureState> {
+    if !screen_recording_preflight() {
+        return Err(anyhow!(
+            "缺少屏幕录制权限，无法确认 Codex 线程是否显示红色错误标记。"
+        ));
+    }
+    let path = capture_window_png(window)?;
+    let scale = capture_scale(window, &path).unwrap_or(1.0);
+    let result = image_thread_failure_state(&path, scale);
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn capture_scale(window: &CodexWindow, path: &PathBuf) -> Result<f64> {
+    let image = image::open(path)
+        .with_context(|| format!("failed to read screenshot {}", path.display()))?;
+    let (width, _) = image.dimensions();
+    if window.width <= 0.0 {
+        return Ok(1.0);
+    }
+    Ok((width as f64 / window.width).clamp(0.75, 3.0))
+}
+
+#[cfg(target_os = "macos")]
+fn capture_window_png(window: &CodexWindow) -> Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "codex-sentinel-window-{}-{}.png",
+        window.window_id,
+        visible_turn_id()
+    ));
+    let rect = format!(
+        "{},{},{},{}",
+        window.x.max(0.0).round() as i64,
+        window.y.max(0.0).round() as i64,
+        window.width.max(1.0).round() as i64,
+        window.height.max(1.0).round() as i64
+    );
+    let status = Command::new("screencapture")
+        .args(["-x", "-R", &rect])
+        .arg(&path)
+        .status()
+        .context("failed to capture Codex window screenshot")?;
+    if status.success() {
+        Ok(path)
+    } else {
+        Err(anyhow!("screencapture failed with {status}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn image_thread_failure_state(path: &PathBuf, scale: f64) -> Result<VisibleThreadFailureState> {
+    let image = image::open(path)
+        .with_context(|| format!("failed to read screenshot {}", path.display()))?;
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Ok(VisibleThreadFailureState::NotFailed);
+    }
+
+    let layout = sidebar_marker_layout(width, height, scale);
+    let red_limits = MarkerLimits::failure(scale);
+    let blue_limits = MarkerLimits::stopped(scale);
+
+    if has_marker_component(&image, layout.left_icon, is_codex_error_red, red_limits)
+        || has_marker_component(&image, layout.status_icon, is_codex_error_red, red_limits)
+    {
+        return Ok(VisibleThreadFailureState::Failed);
+    }
+
+    if has_marker_component(
+        &image,
+        layout.status_icon,
+        is_codex_stopped_blue,
+        blue_limits,
+    ) {
+        return Ok(VisibleThreadFailureState::StoppedMarker);
+    }
+
+    Ok(VisibleThreadFailureState::NotFailed)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct SidebarMarkerLayout {
+    left_icon: MarkerRegion,
+    status_icon: MarkerRegion,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct MarkerRegion {
+    x_start: u32,
+    x_end: u32,
+    y_start: u32,
+    y_end: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct MarkerLimits {
+    min_pixels: usize,
+    min_width: u32,
+    max_width: u32,
+    min_height: u32,
+    max_height: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl MarkerLimits {
+    fn failure(scale: f64) -> Self {
+        Self {
+            min_pixels: scaled_usize(8.0, scale),
+            min_width: scaled_u32(2.0, scale),
+            max_width: scaled_u32(30.0, scale),
+            min_height: scaled_u32(4.0, scale),
+            max_height: scaled_u32(30.0, scale),
+        }
+    }
+
+    fn stopped(scale: f64) -> Self {
+        Self {
+            min_pixels: scaled_usize(8.0, scale),
+            min_width: scaled_u32(3.0, scale),
+            max_width: scaled_u32(18.0, scale),
+            min_height: scaled_u32(3.0, scale),
+            max_height: scaled_u32(18.0, scale),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sidebar_marker_layout(width: u32, height: u32, scale: f64) -> SidebarMarkerLayout {
+    let scale = scale.clamp(0.75, 3.0);
+    let expected_sidebar_width = scaled_u32(300.0, scale).min(width);
+    let sidebar_width = if width <= expected_sidebar_width.saturating_mul(2) {
+        width
+    } else {
+        expected_sidebar_width
+    };
+    let y_start = scaled_u32(44.0, scale).max(height.saturating_mul(40) / 1000);
+    let y_end = height
+        .saturating_mul(760)
+        .checked_div(1000)
+        .unwrap_or(height)
+        .max(y_start.saturating_add(1))
+        .min(height);
+
+    let left_icon = MarkerRegion {
+        x_start: scaled_u32(6.0, scale).min(width),
+        x_end: scaled_u32(92.0, scale).min(sidebar_width).max(1),
+        y_start,
+        y_end,
+    };
+    let status_icon = MarkerRegion {
+        x_start: sidebar_width.saturating_sub(scaled_u32(58.0, scale)),
+        x_end: sidebar_width.saturating_sub(scaled_u32(8.0, scale)).max(1),
+        y_start,
+        y_end,
+    };
+
+    SidebarMarkerLayout {
+        left_icon: clamp_region(left_icon, width, height),
+        status_icon: clamp_region(status_icon, width, height),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clamp_region(region: MarkerRegion, width: u32, height: u32) -> MarkerRegion {
+    let x_start = region.x_start.min(width);
+    let y_start = region.y_start.min(height);
+    MarkerRegion {
+        x_start,
+        x_end: region.x_end.min(width).max(x_start),
+        y_start,
+        y_end: region.y_end.min(height).max(y_start),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn has_marker_component<F>(
+    image: &image::DynamicImage,
+    region: MarkerRegion,
+    predicate: F,
+    limits: MarkerLimits,
+) -> bool
+where
+    F: Fn(u8, u8, u8) -> bool,
+{
+    let width = region.x_end.saturating_sub(region.x_start);
+    let height = region.y_end.saturating_sub(region.y_start);
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let len = width as usize * height as usize;
+    let mut mask = vec![false; len];
+    for local_y in 0..height {
+        for local_x in 0..width {
+            let [r, g, b, _] = image
+                .get_pixel(region.x_start + local_x, region.y_start + local_y)
+                .0;
+            if predicate(r, g, b) {
+                mask[(local_y * width + local_x) as usize] = true;
+            }
+        }
+    }
+
+    let mut visited = vec![false; len];
+    let mut stack = Vec::new();
+    for idx in 0..len {
+        if !mask[idx] || visited[idx] {
+            continue;
+        }
+        let mut pixels = 0usize;
+        let mut min_x = width;
+        let mut min_y = height;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        visited[idx] = true;
+        stack.push(idx);
+
+        while let Some(current) = stack.pop() {
+            let x = (current as u32) % width;
+            let y = (current as u32) / width;
+            pixels += 1;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+
+            let y0 = y.saturating_sub(1);
+            let y1 = (y + 1).min(height.saturating_sub(1));
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(width.saturating_sub(1));
+            for next_y in y0..=y1 {
+                for next_x in x0..=x1 {
+                    if next_x == x && next_y == y {
+                        continue;
+                    }
+                    let next = (next_y * width + next_x) as usize;
+                    if mask[next] && !visited[next] {
+                        visited[next] = true;
+                        stack.push(next);
+                    }
+                }
+            }
+        }
+
+        let component_width = max_x.saturating_sub(min_x).saturating_add(1);
+        let component_height = max_y.saturating_sub(min_y).saturating_add(1);
+        if pixels >= limits.min_pixels
+            && (limits.min_width..=limits.max_width).contains(&component_width)
+            && (limits.min_height..=limits.max_height).contains(&component_height)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn is_codex_error_red(r: u8, g: u8, b: u8) -> bool {
+    r >= 190 && g <= 120 && b <= 120 && r.saturating_sub(g) >= 70 && r.saturating_sub(b) >= 70
+}
+
+#[cfg(target_os = "macos")]
+fn is_codex_stopped_blue(r: u8, g: u8, b: u8) -> bool {
+    b >= 150 && g >= 80 && r <= 140 && b.saturating_sub(r) >= 45
+}
+
+#[cfg(target_os = "macos")]
+fn scaled_u32(points: f64, scale: f64) -> u32 {
+    (points * scale.clamp(0.75, 3.0)).round().max(1.0) as u32
+}
+
+#[cfg(target_os = "macos")]
+fn scaled_usize(points: f64, scale: f64) -> usize {
+    (points * scale.clamp(0.75, 3.0)).round().max(1.0) as usize
+}
+
+#[cfg(target_os = "macos")]
+fn codex_main_pids() -> HashSet<i32> {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    sys.processes()
+        .values()
+        .filter_map(|process| {
+            let name = process.name().to_string_lossy();
+            let cmd = process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if name == "Codex" && cmd.contains("/Applications/Codex.app/Contents/MacOS/Codex") {
+                Some(process.pid().as_u32() as i32)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -328,6 +784,7 @@ fn dict_f64_by_name(dict: &CFDictionary<CFString, CFType>, key: &'static str) ->
 
 #[cfg(target_os = "macos")]
 fn click_at(pid: i32, x: f64, y: f64) -> Result<()> {
+    let window = find_codex_window().ok_or_else(|| anyhow!("Codex window not found"))?;
     let source = event_source()?;
     let point = CGPoint::new(x, y);
     for event_type in [
@@ -338,10 +795,233 @@ fn click_at(pid: i32, x: f64, y: f64) -> Result<()> {
         let event =
             CGEvent::new_mouse_event(source.clone(), event_type, point, CGMouseButton::Left)
                 .map_err(|_| anyhow!("failed to create mouse event"))?;
+        prepare_targeted_mouse_event(&event, &window, point, 1);
         event.post_to_pid(pid);
         std::thread::sleep(Duration::from_millis(35));
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn click_codex_new_chat_button(window: &CodexWindow) -> Result<()> {
+    let x = (window.x + 116.0).clamp(window.x + 24.0, window.x + window.width - 24.0);
+    let y = (window.y + 62.0).clamp(window.y + 48.0, window.y + window.height - 24.0);
+    click_at(window.pid, x, y)?;
+    std::thread::sleep(Duration::from_millis(1_100));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn prompt_focus_points(
+    window: &CodexWindow,
+    attempt: usize,
+    placement: ComposerPlacement,
+) -> Vec<CGPoint> {
+    match placement {
+        ComposerPlacement::ExistingThread => existing_thread_prompt_focus_points(window, attempt),
+        ComposerPlacement::NewThread => new_thread_prompt_focus_points(window, attempt),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn existing_thread_prompt_focus_points(window: &CodexWindow, attempt: usize) -> Vec<CGPoint> {
+    let x_center = clamp_window_x(window, window.x + (window.width * 0.50));
+    let x_left = clamp_window_x(window, window.x + (window.width * 0.42));
+    let x_right = clamp_window_x(window, window.x + (window.width * 0.58));
+    let y_upper = clamp_window_y(window, window.y + window.height - 146.0);
+    let y_middle = clamp_window_y(window, window.y + window.height - 118.0);
+    let y_lower = clamp_window_y(window, window.y + window.height - 96.0);
+
+    let points = match attempt % 4 {
+        0 => vec![
+            CGPoint::new(x_center, y_middle),
+            CGPoint::new(x_left, y_middle),
+        ],
+        1 => vec![
+            CGPoint::new(x_center, y_upper),
+            CGPoint::new(x_right, y_upper),
+        ],
+        2 => vec![
+            CGPoint::new(x_center, y_lower),
+            CGPoint::new(x_left, y_lower),
+        ],
+        _ => vec![
+            CGPoint::new(x_left, y_middle),
+            CGPoint::new(x_right, y_middle),
+        ],
+    };
+    points
+}
+
+#[cfg(target_os = "macos")]
+fn new_thread_prompt_focus_points(window: &CodexWindow, attempt: usize) -> Vec<CGPoint> {
+    let x_center = clamp_window_x(window, window.x + (window.width * 0.56));
+    let x_left = clamp_window_x(window, window.x + (window.width * 0.45));
+    let x_right = clamp_window_x(window, window.x + (window.width * 0.66));
+    let y_center = clamp_window_y(window, window.y + (window.height * 0.49));
+    let y_upper = clamp_window_y(window, window.y + (window.height * 0.46));
+    let y_lower = clamp_window_y(window, window.y + (window.height * 0.52));
+
+    match attempt % 4 {
+        0 => vec![
+            CGPoint::new(x_center, y_center),
+            CGPoint::new(x_left, y_center),
+        ],
+        1 => vec![
+            CGPoint::new(x_left, y_upper),
+            CGPoint::new(x_center, y_center),
+        ],
+        2 => vec![
+            CGPoint::new(x_right, y_center),
+            CGPoint::new(x_center, y_lower),
+        ],
+        _ => vec![
+            CGPoint::new(x_center, y_upper),
+            CGPoint::new(x_right, y_lower),
+        ],
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn send_button_point(
+    window: &CodexWindow,
+    attempt: usize,
+    placement: ComposerPlacement,
+) -> CGPoint {
+    match placement {
+        ComposerPlacement::ExistingThread => existing_thread_send_button_point(window, attempt),
+        ComposerPlacement::NewThread => new_thread_send_button_point(window, attempt),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn existing_thread_send_button_point(window: &CodexWindow, attempt: usize) -> CGPoint {
+    let x = match attempt % 3 {
+        1 => window.x + window.width - 72.0,
+        2 => window.x + window.width - 46.0,
+        _ => window.x + window.width - 58.0,
+    };
+    let y = match attempt % 3 {
+        1 => window.y + window.height - 96.0,
+        2 => window.y + window.height - 72.0,
+        _ => window.y + window.height - 84.0,
+    };
+    CGPoint::new(clamp_window_x(window, x), clamp_window_y(window, y))
+}
+
+#[cfg(target_os = "macos")]
+fn new_thread_send_button_point(window: &CodexWindow, attempt: usize) -> CGPoint {
+    let x = match attempt % 3 {
+        1 => window.x + (window.width * 0.820),
+        2 => window.x + (window.width * 0.807),
+        _ => window.x + (window.width * 0.813),
+    };
+    let y = match attempt % 3 {
+        1 => window.y + (window.height * 0.466),
+        2 => window.y + (window.height * 0.482),
+        _ => window.y + (window.height * 0.472),
+    };
+    CGPoint::new(clamp_window_x(window, x), clamp_window_y(window, y))
+}
+
+#[cfg(target_os = "macos")]
+fn trigger_send(window: &CodexWindow, attempt: usize, placement: ComposerPlacement) -> Result<()> {
+    if matches!(placement, ComposerPlacement::ExistingThread) {
+        match attempt % 4 {
+            0 | 1 => {
+                let point = send_button_point(window, attempt, placement);
+                click_at(window.pid, point.x, point.y)?;
+            }
+            2 => {
+                post_key_press(window.pid, KeyCode::RETURN, CGEventFlags::empty())?;
+            }
+            _ => {
+                post_key_press(
+                    window.pid,
+                    KeyCode::RETURN,
+                    CGEventFlags::CGEventFlagCommand,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+
+    match attempt % 4 {
+        0 => {
+            let point = send_button_point(window, attempt, placement);
+            click_at(window.pid, point.x, point.y)?;
+        }
+        1 => {
+            post_key_press(window.pid, KeyCode::RETURN, CGEventFlags::empty())?;
+        }
+        2 => {
+            post_key_press(window.pid, KeyCode::TAB, CGEventFlags::empty())?;
+            post_key_press(window.pid, KeyCode::SPACE, CGEventFlags::empty())?;
+        }
+        _ => {
+            post_key_press(window.pid, KeyCode::TAB, CGEventFlags::empty())?;
+            post_key_press(window.pid, KeyCode::TAB, CGEventFlags::empty())?;
+            post_key_press(window.pid, KeyCode::SPACE, CGEventFlags::empty())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clamp_window_x(window: &CodexWindow, x: f64) -> f64 {
+    x.clamp(window.x + 24.0, window.x + window.width - 24.0)
+}
+
+#[cfg(target_os = "macos")]
+fn clamp_window_y(window: &CodexWindow, y: f64) -> f64 {
+    y.clamp(window.y + 80.0, window.y + window.height - 36.0)
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_targeted_mouse_event(
+    event: &CGEvent,
+    window: &CodexWindow,
+    screen_point: CGPoint,
+    click_state: i64,
+) {
+    event.set_location(screen_point);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_state);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER, 0);
+    event.set_integer_value_field(EventField::MOUSE_EVENT_SUB_TYPE, 3);
+    event.set_integer_value_field(
+        EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER,
+        window.window_id,
+    );
+    event.set_integer_value_field(
+        EventField::MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER_THAT_CAN_HANDLE_THIS_EVENT,
+        window.window_id,
+    );
+    let local_point = CGPoint::new(screen_point.x - window.x, screen_point.y - window.y);
+    set_window_location(event.as_ptr(), local_point);
+}
+
+#[cfg(target_os = "macos")]
+type CGEventSetWindowLocationFn = unsafe extern "C" fn(CGEventRef, CGPoint);
+
+#[cfg(target_os = "macos")]
+fn set_window_location(event: CGEventRef, local_point: CGPoint) {
+    static SET_WINDOW_LOCATION: OnceLock<Option<CGEventSetWindowLocationFn>> = OnceLock::new();
+    let setter = SET_WINDOW_LOCATION.get_or_init(|| {
+        let symbol = CString::new("CGEventSetWindowLocation").ok()?;
+        let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr()) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe {
+                std::mem::transmute::<*mut libc::c_void, CGEventSetWindowLocationFn>(ptr)
+            })
+        }
+    });
+    if let Some(setter) = setter {
+        unsafe {
+            setter(event, local_point);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -351,6 +1031,59 @@ fn post_command_v(pid: i32) -> Result<()> {
     post_key(pid, KeyCode::ANSI_V, true, flags)?;
     post_key(pid, KeyCode::ANSI_V, false, flags)?;
     post_key(pid, KeyCode::COMMAND, false, CGEventFlags::empty())
+}
+
+#[cfg(target_os = "macos")]
+fn post_command_n(pid: i32) -> Result<()> {
+    let flags = CGEventFlags::CGEventFlagCommand;
+    post_key(pid, KeyCode::COMMAND, true, flags)?;
+    post_key(pid, KeyCode::ANSI_N, true, flags)?;
+    post_key(pid, KeyCode::ANSI_N, false, flags)?;
+    post_key(pid, KeyCode::COMMAND, false, CGEventFlags::empty())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_current_input(pid: i32) -> Result<()> {
+    let flags = CGEventFlags::CGEventFlagCommand;
+    post_key(pid, KeyCode::COMMAND, true, flags)?;
+    post_key(pid, KeyCode::ANSI_A, true, flags)?;
+    post_key(pid, KeyCode::ANSI_A, false, flags)?;
+    post_key(pid, KeyCode::COMMAND, false, CGEventFlags::empty())?;
+    post_key(pid, KeyCode::DELETE, true, CGEventFlags::empty())?;
+    post_key(pid, KeyCode::DELETE, false, CGEventFlags::empty())
+}
+
+#[cfg(target_os = "macos")]
+fn insert_prompt_text(pid: i32, prompt: &str, attempt: usize) -> Result<()> {
+    if attempt % 2 == 0 {
+        write_clipboard(prompt.as_bytes())?;
+        post_command_v(pid)?;
+    } else {
+        type_unicode_text(pid, prompt)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn type_unicode_text(pid: i32, text: &str) -> Result<()> {
+    for chunk in text.encode_utf16().collect::<Vec<_>>().chunks(64) {
+        let source = event_source()?;
+        for keydown in [true, false] {
+            let event = CGEvent::new_keyboard_event(source.clone(), 0, keydown)
+                .map_err(|_| anyhow!("failed to create unicode keyboard event"))?;
+            unsafe {
+                CGEventKeyboardSetUnicodeString(event.as_ptr(), chunk.len(), chunk.as_ptr());
+            }
+            event.post_to_pid(pid);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    Ok(())
+}
+
+fn post_key_press(pid: i32, keycode: u16, flags: CGEventFlags) -> Result<()> {
+    post_key(pid, keycode, true, flags)?;
+    post_key(pid, keycode, false, flags)
 }
 
 #[cfg(target_os = "macos")]
@@ -368,19 +1101,6 @@ fn post_key(pid: i32, keycode: u16, keydown: bool, flags: CGEventFlags) -> Resul
 fn event_source() -> Result<CGEventSource> {
     CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
         .map_err(|_| anyhow!("failed to create CGEvent source"))
-}
-
-fn read_clipboard() -> Result<Vec<u8>> {
-    let output = Command::new("pbpaste")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .context("failed to read clipboard")?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(anyhow!("pbpaste failed with {}", output.status))
-    }
 }
 
 fn write_clipboard(bytes: &[u8]) -> Result<()> {
@@ -401,10 +1121,117 @@ fn write_clipboard(bytes: &[u8]) -> Result<()> {
     }
 }
 
-fn visible_turn_id() -> String {
+pub fn visible_turn_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
     format!("visible-desktop-{millis}")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use image::{Rgba, RgbaImage};
+
+    fn marker_fixture<F>(name: &str, draw: F) -> PathBuf
+    where
+        F: FnOnce(&mut RgbaImage),
+    {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("codex-sentinel-{name}-{nanos}.png"));
+        let mut image = RgbaImage::from_pixel(1400, 700, Rgba([245, 245, 245, 255]));
+        draw(&mut image);
+        image.save(&path).expect("save marker fixture");
+        path
+    }
+
+    fn fill_rect(
+        image: &mut RgbaImage,
+        x0: u32,
+        y0: u32,
+        width: u32,
+        height: u32,
+        color: Rgba<u8>,
+    ) {
+        for y in y0..y0 + height {
+            for x in x0..x0 + width {
+                image.put_pixel(x, y, color);
+            }
+        }
+    }
+
+    fn state_for_fixture(path: &PathBuf) -> VisibleThreadFailureState {
+        let state = image_thread_failure_state(path, 2.0).expect("inspect fixture");
+        let _ = std::fs::remove_file(path);
+        state
+    }
+
+    #[test]
+    fn detects_red_failure_marker_left_of_thread_title() {
+        let path = marker_fixture("red-left", |image| {
+            fill_rect(image, 76, 150, 10, 24, Rgba([230, 48, 48, 255]));
+            fill_rect(image, 72, 168, 18, 8, Rgba([230, 48, 48, 255]));
+        });
+
+        assert_eq!(state_for_fixture(&path), VisibleThreadFailureState::Failed);
+    }
+
+    #[test]
+    fn detects_red_failure_marker_in_sidebar_status_slot() {
+        let path = marker_fixture("red-status", |image| {
+            fill_rect(image, 542, 150, 22, 22, Rgba([225, 58, 58, 255]));
+        });
+
+        assert_eq!(state_for_fixture(&path), VisibleThreadFailureState::Failed);
+    }
+
+    #[test]
+    fn detects_blue_stopped_marker_in_sidebar_status_slot() {
+        let path = marker_fixture("blue-status", |image| {
+            fill_rect(image, 550, 154, 12, 12, Rgba([52, 138, 255, 255]));
+        });
+
+        assert_eq!(
+            state_for_fixture(&path),
+            VisibleThreadFailureState::StoppedMarker
+        );
+    }
+
+    #[test]
+    fn red_failure_marker_wins_over_blue_stopped_marker() {
+        let path = marker_fixture("red-and-blue", |image| {
+            fill_rect(image, 76, 150, 10, 24, Rgba([230, 48, 48, 255]));
+            fill_rect(image, 550, 154, 12, 12, Rgba([52, 138, 255, 255]));
+        });
+
+        assert_eq!(state_for_fixture(&path), VisibleThreadFailureState::Failed);
+    }
+
+    #[test]
+    fn ignores_red_pixels_in_main_chat_content() {
+        let path = marker_fixture("red-content", |image| {
+            fill_rect(image, 700, 180, 18, 18, Rgba([230, 48, 48, 255]));
+        });
+
+        assert_eq!(
+            state_for_fixture(&path),
+            VisibleThreadFailureState::NotFailed
+        );
+    }
+
+    #[test]
+    fn ignores_gray_sidebar_spinner() {
+        let path = marker_fixture("gray-status", |image| {
+            fill_rect(image, 542, 150, 22, 22, Rgba([135, 135, 135, 255]));
+        });
+
+        assert_eq!(
+            state_for_fixture(&path),
+            VisibleThreadFailureState::NotFailed
+        );
+    }
 }
