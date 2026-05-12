@@ -312,6 +312,12 @@ mod tests {
         assert_eq!(disconnected.kind, RecoveryKind::RetrySoon);
         assert!(disconnected.auto_allowed);
         assert_eq!(disconnected.delay_seconds, 3);
+        let disconnected_with_request_id = classify_error(
+            "stream disconnected before completion: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 00000000-0000-4000-8000-000000000000 in your message.",
+        );
+        assert_eq!(disconnected_with_request_id.kind, RecoveryKind::RetrySoon);
+        assert!(disconnected_with_request_id.auto_allowed);
+        assert_eq!(disconnected_with_request_id.delay_seconds, 3);
         assert_eq!(
             classify_error("stream disconnected - retrying sampling request (1/5 in 202ms)").kind,
             RecoveryKind::None

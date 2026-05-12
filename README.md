@@ -13,6 +13,7 @@ Codex Sentinel 是一个本机 macOS 菜单栏工具，用 Rust/Tauri 监控 Cod
 - 通过 macOS Accessibility 打开 `codex://threads/<id>`，在 Codex APP 可见输入框发送继续或自定义指令。
 - 安装官方 Codex `Stop` hook，在任务停止事件里判断是否需要让 Codex 继续。
 - 运行 Telegram daemon，提供配对、状态、线程列表、线程详情、一键继续、输入指令和推送提醒。
+- Codex 线程正常完成时，通过 Stop hook 向已配对的 Telegram 会话推送最后反馈。
 - 作为菜单栏常驻应用运行，关闭窗口只隐藏；菜单栏图标可打开面板、切换可见自动恢复或退出。
 - 安装轻量 lifecycle helper，开机后跟随 Codex APP：Codex 启动时拉起 Sentinel，Codex 退出时关闭 Sentinel GUI 和 daemon。
 
@@ -114,7 +115,8 @@ Stop -> codex-sentinel hook-stop
 Hook 事件写入 `~/.codex-sentinel/hook-events.jsonl`，包含来源、动作、延迟、分类结果和最后反馈快照。
 Sentinel 会在短时间内按 `event_key` 抑制重复 Stop 事件；需要较长退避的事件不会让 Stop
 hook 一直 sleep，而是交给 watcher、Telegram 或桌面面板稍后恢复。控制台会显示最近 Stop
-Hook 事件，并检查安装的 hook 是否指向 `/Applications/Codex Sentinel.app`。
+Hook 事件，并检查安装的 hook 是否指向 `/Applications/Codex Sentinel.app`。正常完成事件会记录为
+`completed`，并由轻量后台子进程发送带 `追加指令` 按钮的 Telegram 完成通知，不阻塞 Codex Stop hook。
 
 ## macOS 权限
 

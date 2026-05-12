@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -11,6 +12,7 @@ use serde_json::{Value, json};
 use crate::codex;
 use crate::config::{self, AppConfig};
 use crate::recovery::{RecoveryDecision, RecoveryKind, classify_error, sanitized_recovery_text};
+use crate::telegram;
 
 const SENTINEL_MARKER: &str = "codex-sentinel";
 const STOP_TIMEOUT_SECONDS: u64 = 240;
@@ -18,6 +20,7 @@ const STOP_LOG_LOOKBACK_SECONDS: i64 = 300;
 const STOP_LOG_LOOKBACK_WITH_TURN_SECONDS: i64 = 1800;
 const STOP_HOOK_MAX_INLINE_DELAY_SECONDS: u64 = 10;
 const STOP_HOOK_DEDUP_WINDOW_SECONDS: i64 = 300;
+const STOP_HOOK_COMPLETION_DEDUP_WINDOW_SECONDS: i64 = 300;
 const RECENT_HOOK_EVENT_LIMIT: usize = 5;
 const INSTALLED_APP_EXECUTABLE: &str =
     "/Applications/Codex Sentinel.app/Contents/MacOS/codex-sentinel";
@@ -92,7 +95,7 @@ struct StopClassification {
     latest_feedback: Option<HookFeedbackSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HookFeedbackSnapshot {
     thread_id: String,
     title: String,
@@ -213,7 +216,14 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
         should_sleep_in_hook(),
         duplicate,
     )?;
-    let action = stop_hook_action(&input, &cfg, &classification.decision, duplicate);
+    let action = stop_hook_action(&input, &cfg, &classification, duplicate);
+    let completion_duplicate = if action == "completed" {
+        recent_event_with_key(&event_key, STOP_HOOK_COMPLETION_DEDUP_WINDOW_SECONDS)
+            .unwrap_or(None)
+            .is_some()
+    } else {
+        false
+    };
 
     if should_log_stop_event(&classification, action) {
         if let Err(err) =
@@ -222,8 +232,25 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
             tracing::warn!("failed to write Stop hook event: {err:#}");
         }
     }
+    if action == "completed" && !completion_duplicate {
+        if let Err(err) = spawn_completion_notification(&input, &classification) {
+            tracing::warn!("failed to spawn completion notification: {err:#}");
+        }
+    }
     print_json(&response)?;
     Ok(())
+}
+
+pub async fn run_notify_completion_from_stdin() -> Result<()> {
+    let notification = read_completion_notification()?;
+    let cfg = config::load_or_create().unwrap_or_default();
+    let text = format_completion_notification(&notification);
+    telegram::notify_configured_text_with_keyboard(
+        &cfg,
+        &text,
+        completion_notification_keyboard(&notification),
+    )
+    .await
 }
 
 fn classify_stop_input(input: &HookInput) -> StopClassification {
@@ -324,7 +351,7 @@ fn stop_classification(
     source: &str,
     body: &str,
 ) -> StopClassification {
-    let latest_feedback = if decision.kind != RecoveryKind::None {
+    let latest_feedback = if decision.kind != RecoveryKind::None || !body.trim().is_empty() {
         latest_feedback_snapshot(input)
     } else {
         None
@@ -674,13 +701,18 @@ fn backup_path(path: &Path) -> PathBuf {
 fn stop_hook_action(
     input: &HookInput,
     cfg: &AppConfig,
-    decision: &RecoveryDecision,
+    classification: &StopClassification,
     duplicate: bool,
 ) -> &'static str {
+    let decision = &classification.decision;
     if input.stop_hook_active.unwrap_or(false) {
         "loop_prevented"
     } else if decision.kind == RecoveryKind::None {
-        "none"
+        if is_normal_completion(classification) {
+            "completed"
+        } else {
+            "none"
+        }
     } else if duplicate {
         "deduped"
     } else if !cfg.recovery.auto_recover || !decision.auto_allowed {
@@ -693,6 +725,15 @@ fn stop_hook_action(
     } else {
         "continue"
     }
+}
+
+fn is_normal_completion(classification: &StopClassification) -> bool {
+    classification.decision.kind == RecoveryKind::None
+        && !classification.body.trim().is_empty()
+        && matches!(
+            classification.source.as_str(),
+            "last_assistant_message" | "transcript_path"
+        )
 }
 
 fn should_log_stop_event(classification: &StopClassification, action: &str) -> bool {
@@ -780,6 +821,102 @@ fn append_hook_event(line: &Value) -> Result<()> {
 
 fn hook_events_path() -> PathBuf {
     config::config_dir().join("hook-events.jsonl")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompletionNotification {
+    event: Option<String>,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+    source: String,
+    body: String,
+    latest_feedback: Option<HookFeedbackSnapshot>,
+}
+
+fn spawn_completion_notification(
+    input: &HookInput,
+    classification: &StopClassification,
+) -> Result<()> {
+    let payload = CompletionNotification {
+        event: input.hook_event_name.clone(),
+        session_id: input.session_id.clone(),
+        turn_id: input.turn_id.clone(),
+        cwd: input.cwd.clone(),
+        model: input.model.clone(),
+        source: classification.source.clone(),
+        body: truncate(&classification.body, 1600),
+        latest_feedback: classification.latest_feedback.clone(),
+    };
+    let raw = serde_json::to_vec(&payload)?;
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("notify-completion")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn completion notification helper")?;
+    let Some(mut stdin) = child.stdin.take() else {
+        return Err(anyhow!(
+            "completion notification helper stdin is unavailable"
+        ));
+    };
+    stdin.write_all(&raw)?;
+    drop(stdin);
+    Ok(())
+}
+
+fn read_completion_notification() -> Result<CompletionNotification> {
+    let raw = read_stdin_string()?;
+    serde_json::from_str(&raw).context("failed to parse completion notification JSON from stdin")
+}
+
+fn format_completion_notification(notification: &CompletionNotification) -> String {
+    let title = notification
+        .latest_feedback
+        .as_ref()
+        .map(|feedback| feedback.title.as_str())
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or("未命名线程");
+    let thread_id = notification
+        .latest_feedback
+        .as_ref()
+        .map(|feedback| feedback.thread_id.as_str())
+        .or(notification.session_id.as_deref())
+        .unwrap_or("-");
+    let feedback_text = notification
+        .latest_feedback
+        .as_ref()
+        .map(|feedback| feedback.text.as_str())
+        .unwrap_or(notification.body.as_str());
+
+    format!(
+        "线程正常完成\n{}\n{}\n\n最后反馈：\n{}",
+        title,
+        thread_id,
+        truncate(feedback_text, 2600)
+    )
+}
+
+fn completion_notification_keyboard(notification: &CompletionNotification) -> Option<Value> {
+    let thread_id = completion_notification_thread_id(notification)?;
+    Some(json!({
+        "inline_keyboard": [[{
+            "text": "追加指令",
+            "callback_data": format!("ask:{thread_id}")
+        }]]
+    }))
+}
+
+fn completion_notification_thread_id(notification: &CompletionNotification) -> Option<&str> {
+    notification
+        .latest_feedback
+        .as_ref()
+        .map(|feedback| feedback.thread_id.as_str())
+        .or(notification.session_id.as_deref())
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty() && *thread_id != "-")
 }
 
 pub fn recent_hook_events(limit: usize) -> Result<Vec<HookEventSummary>> {
@@ -900,6 +1037,87 @@ mod tests {
         assert_eq!(classification.decision.kind, RecoveryKind::None);
         assert_eq!(classification.body, "任务已经完成，验证通过。");
         assert_eq!(classification.source, "last_assistant_message");
+        assert_eq!(
+            stop_hook_action(&input, &AppConfig::default(), &classification, false),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn normal_completion_notification_uses_latest_feedback_snapshot() {
+        let notification = CompletionNotification {
+            event: Some("Stop".to_string()),
+            session_id: Some("thread-a".to_string()),
+            turn_id: Some("turn-a".to_string()),
+            cwd: Some("/Users/gosu/Documents".to_string()),
+            model: Some("gpt".to_string()),
+            source: "last_assistant_message".to_string(),
+            body: "任务已经完成，验证通过。".to_string(),
+            latest_feedback: Some(HookFeedbackSnapshot {
+                thread_id: "thread-a".to_string(),
+                title: "测试线程".to_string(),
+                timestamp: None,
+                text: "最终结果在这里。".to_string(),
+            }),
+        };
+
+        let text = format_completion_notification(&notification);
+        assert!(text.contains("线程正常完成"));
+        assert!(text.contains("测试线程"));
+        assert!(text.contains("thread-a"));
+        assert!(text.contains("最终结果在这里。"));
+
+        let keyboard = completion_notification_keyboard(&notification).unwrap();
+        assert_eq!(
+            keyboard["inline_keyboard"][0][0]["text"].as_str(),
+            Some("追加指令")
+        );
+        assert_eq!(
+            keyboard["inline_keyboard"][0][0]["callback_data"].as_str(),
+            Some("ask:thread-a")
+        );
+    }
+
+    #[test]
+    fn transcript_fallback_normal_completion_is_notified() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-sentinel-transcript-{}.jsonl",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let raw = serde_json::to_string(&json!({
+            "timestamp": "2026-05-12T10:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "从 transcript 读到的完成反馈"}
+                ]
+            }
+        }))
+        .unwrap();
+        fs::write(&path, raw).unwrap();
+
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: None,
+            transcript_path: Some(path.display().to_string()),
+            cwd: None,
+            model: None,
+            turn_id: None,
+            stop_hook_active: Some(false),
+            last_assistant_message: None,
+        };
+        let classification = classify_stop_input(&input);
+
+        assert_eq!(classification.decision.kind, RecoveryKind::None);
+        assert_eq!(classification.source, "transcript_path");
+        assert_eq!(
+            stop_hook_action(&input, &AppConfig::default(), &classification, false),
+            "completed"
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1024,7 +1242,16 @@ mod tests {
                 .unwrap_or_default()
                 .contains("同一个 Stop 事件")
         );
-        assert_eq!(stop_hook_action(&input, &cfg, &decision, true), "deduped");
+        let classification = stop_classification(
+            &input,
+            decision,
+            "last_assistant_message",
+            "Turn error: 503 Service Unavailable",
+        );
+        assert_eq!(
+            stop_hook_action(&input, &cfg, &classification, true),
+            "deduped"
+        );
     }
 
     #[test]
@@ -1060,7 +1287,12 @@ mod tests {
                 .unwrap_or_default()
                 .contains("不在行内长时间等待")
         );
-        assert_eq!(stop_hook_action(&input, &cfg, &decision, false), "deferred");
+        let classification =
+            stop_classification(&input, decision, "codex_log_fallback", "Long backoff");
+        assert_eq!(
+            stop_hook_action(&input, &cfg, &classification, false),
+            "deferred"
+        );
     }
 
     #[test]

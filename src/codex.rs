@@ -1891,6 +1891,39 @@ mod tests {
     }
 
     #[test]
+    fn thread_recovery_log_lookup_finds_stream_disconnect_with_request_id() {
+        let db = temp_db_path("thread-recovery-log-stream-request-id");
+        let conn = Connection::open(&db).expect("create temp db");
+        conn.execute_batch(
+            "CREATE TABLE logs (
+                id INTEGER PRIMARY KEY,
+                ts INTEGER,
+                ts_nanos INTEGER,
+                level TEXT,
+                target TEXT,
+                thread_id TEXT,
+                feedback_log_body TEXT
+            );",
+        )
+        .expect("create logs table");
+        conn.execute(
+            "INSERT INTO logs (id, ts, ts_nanos, level, target, thread_id, feedback_log_body)
+             VALUES (1, 1778304100, 1, 'INFO', 'codex_core::session::turn', 'thread-a', ?1)",
+            ["stream disconnected before completion: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 00000000-0000-4000-8000-000000000000 in your message."],
+        )
+        .expect("insert stream disconnect request-id log");
+        drop(conn);
+
+        let event = latest_recovery_log_for_thread_from_db(&db, "thread-a", 1778304090)
+            .expect("lookup succeeds")
+            .expect("event found");
+        assert!(event.body.contains("help.openai.com"));
+        assert_eq!(classify_error(&event.body).kind, RecoveryKind::RetrySoon);
+
+        let _ = fs::remove_file(db);
+    }
+
+    #[test]
     fn thread_recovery_log_lookup_matches_thread_id_embedded_in_body() {
         let db = temp_db_path("thread-recovery-log-body-thread");
         let conn = Connection::open(&db).expect("create temp db");

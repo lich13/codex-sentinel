@@ -194,6 +194,26 @@ pub async fn run_bot(cfg: AppConfig) -> Result<()> {
     }
 }
 
+pub async fn notify_configured_text_with_keyboard(
+    cfg: &AppConfig,
+    text: &str,
+    keyboard: Option<Value>,
+) -> Result<()> {
+    if !cfg.telegram.enabled {
+        tracing::debug!("telegram notification skipped because telegram is disabled");
+        return Ok(());
+    }
+    let client = telegram_client()?;
+    notify_configured_chats(
+        &client,
+        &cfg.telegram.bot_token,
+        &cfg.telegram.allowed_chat_ids,
+        text,
+        keyboard,
+    )
+    .await
+}
+
 async fn get_updates(
     client: &Client,
     token: &str,
@@ -278,6 +298,7 @@ async fn watch_once(
                 &cfg.telegram.bot_token,
                 &cfg.telegram.allowed_chat_ids,
                 &format_watch_alert(&candidate),
+                None,
             )
             .await?;
         }
@@ -309,6 +330,7 @@ async fn watch_once(
                 &cfg.telegram.bot_token,
                 &cfg.telegram.allowed_chat_ids,
                 &format!("自动恢复结果\n{result}"),
+                None,
             )
             .await?;
         }
@@ -1069,6 +1091,7 @@ async fn notify_configured_chats(
     token: &str,
     chat_ids: &[i64],
     text: &str,
+    keyboard: Option<Value>,
 ) -> Result<()> {
     if token.trim().is_empty() || chat_ids.is_empty() {
         tracing::debug!("watch notification skipped because telegram is not fully configured");
@@ -1076,7 +1099,7 @@ async fn notify_configured_chats(
     }
 
     for chat_id in chat_ids {
-        send_message(client, token, *chat_id, text, None).await?;
+        send_message(client, token, *chat_id, text, keyboard.clone()).await?;
     }
     Ok(())
 }

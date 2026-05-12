@@ -159,6 +159,9 @@ async fn main() -> Result<()> {
         Some("--hook-stop") | Some("hook-stop") => {
             hooks::run_stop_hook_from_stdin()?;
         }
+        Some("--notify-completion") | Some("notify-completion") => {
+            hooks::run_notify_completion_from_stdin().await?;
+        }
         Some("--config") | Some("config") => {
             let cfg = config::load_or_create()?;
             println!("config: {}", config::config_path().display());
