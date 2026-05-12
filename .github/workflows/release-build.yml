@@ -88,10 +88,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+          components: rustfmt
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           workspaces: |
             . -> target
 
@@ -126,10 +128,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+          components: rustfmt
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           workspaces: |
             . -> target
 
