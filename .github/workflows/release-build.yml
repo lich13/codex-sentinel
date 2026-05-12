@@ -230,7 +230,7 @@ jobs:
           TAG_NAME="${{ steps.tag.outputs.tag_name }}"
 
           if gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            RELEASE_ID="$(gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --json id -q '.id')"
+            RELEASE_ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}" --jq '.id')"
             gh api \
               --method PATCH \
               "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
