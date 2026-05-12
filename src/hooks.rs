@@ -85,6 +85,7 @@ struct HookEventLine {
     delay_seconds: Option<u64>,
     decision: Option<RecoveryDecision>,
     body: Option<String>,
+    latest_feedback: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +244,14 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
 
 pub async fn run_notify_completion_from_stdin() -> Result<()> {
     let notification = read_completion_notification()?;
+    if !should_notify_completion(&notification) {
+        tracing::debug!(
+            session_id = ?notification.session_id,
+            turn_id = ?notification.turn_id,
+            "completion notification skipped because no Codex thread feedback snapshot is available"
+        );
+        return Ok(());
+    }
     let cfg = config::load_or_create().unwrap_or_default();
     let text = format_completion_notification(&notification);
     telegram::notify_configured_text_with_keyboard(
@@ -729,11 +738,34 @@ fn stop_hook_action(
 
 fn is_normal_completion(classification: &StopClassification) -> bool {
     classification.decision.kind == RecoveryKind::None
+        && classification.latest_feedback.is_some()
         && !classification.body.trim().is_empty()
         && matches!(
             classification.source.as_str(),
             "last_assistant_message" | "transcript_path"
         )
+        && !is_machine_control_payload(&classification.body)
+}
+
+fn is_machine_control_payload(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+        return false;
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    object
+        .keys()
+        .all(|key| matches!(key.as_str(), "suggestions" | "exclude"))
+        && object
+            .keys()
+            .any(|key| matches!(key.as_str(), "suggestions" | "exclude"))
 }
 
 fn should_log_stop_event(classification: &StopClassification, action: &str) -> bool {
@@ -872,6 +904,10 @@ fn read_completion_notification() -> Result<CompletionNotification> {
     serde_json::from_str(&raw).context("failed to parse completion notification JSON from stdin")
 }
 
+fn should_notify_completion(notification: &CompletionNotification) -> bool {
+    notification.latest_feedback.is_some()
+}
+
 fn format_completion_notification(notification: &CompletionNotification) -> String {
     let title = notification
         .latest_feedback
@@ -937,6 +973,9 @@ fn recent_hook_events_from_path(path: &Path, limit: usize) -> Result<Vec<HookEve
             continue;
         }
         if let Ok(event) = serde_json::from_str::<HookEventLine>(trimmed) {
+            if is_stale_completion_event_without_feedback(&event) {
+                continue;
+            }
             events.push(event);
         }
     }
@@ -947,6 +986,10 @@ fn recent_hook_events_from_path(path: &Path, limit: usize) -> Result<Vec<HookEve
         .take(limit)
         .map(HookEventSummary::from)
         .collect())
+}
+
+fn is_stale_completion_event_without_feedback(event: &HookEventLine) -> bool {
+    event.action == "completed" && event.latest_feedback.is_none()
 }
 
 fn recent_event_with_key(key: &str, max_age_seconds: i64) -> Result<Option<HookEventSummary>> {
@@ -1021,6 +1064,15 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    fn test_feedback_snapshot(thread_id: &str) -> HookFeedbackSnapshot {
+        HookFeedbackSnapshot {
+            thread_id: thread_id.to_string(),
+            title: "测试线程".to_string(),
+            timestamp: None,
+            text: "最终结果在这里。".to_string(),
+        }
+    }
+
     #[test]
     fn stop_hook_does_not_fallback_after_normal_assistant_message() {
         let input = HookInput {
@@ -1039,7 +1091,72 @@ mod tests {
         assert_eq!(classification.source, "last_assistant_message");
         assert_eq!(
             stop_hook_action(&input, &AppConfig::default(), &classification, false),
+            "none"
+        );
+    }
+
+    #[test]
+    fn normal_completion_requires_latest_feedback_snapshot() {
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: Some("thread".to_string()),
+            transcript_path: None,
+            cwd: None,
+            model: None,
+            turn_id: Some("turn".to_string()),
+            stop_hook_active: Some(false),
+            last_assistant_message: Some("任务已经完成，验证通过。".to_string()),
+        };
+        let mut classification = classify_stop_input(&input);
+
+        assert_eq!(
+            stop_hook_action(&input, &AppConfig::default(), &classification, false),
+            "none"
+        );
+
+        classification.latest_feedback = Some(test_feedback_snapshot("thread"));
+        assert_eq!(
+            stop_hook_action(&input, &AppConfig::default(), &classification, false),
             "completed"
+        );
+    }
+
+    #[test]
+    fn stop_hook_ignores_machine_control_json_payloads() {
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: Some("thread".to_string()),
+            transcript_path: None,
+            cwd: None,
+            model: None,
+            turn_id: Some("turn".to_string()),
+            stop_hook_active: Some(false),
+            last_assistant_message: Some(
+                r#"{"suggestions":[{"appId":"","description":"x","prompt":"y","title":"z"}]}"#
+                    .to_string(),
+            ),
+        };
+        let classification = classify_stop_input(&input);
+        assert_eq!(classification.decision.kind, RecoveryKind::None);
+        assert_eq!(classification.source, "last_assistant_message");
+        assert_eq!(
+            stop_hook_action(&input, &AppConfig::default(), &classification, false),
+            "none"
+        );
+
+        let exclude_input = HookInput {
+            last_assistant_message: Some(r#"{"exclude":[]}"#.to_string()),
+            ..input
+        };
+        let exclude_classification = classify_stop_input(&exclude_input);
+        assert_eq!(
+            stop_hook_action(
+                &exclude_input,
+                &AppConfig::default(),
+                &exclude_classification,
+                false
+            ),
+            "none"
         );
     }
 
@@ -1053,14 +1170,10 @@ mod tests {
             model: Some("gpt".to_string()),
             source: "last_assistant_message".to_string(),
             body: "任务已经完成，验证通过。".to_string(),
-            latest_feedback: Some(HookFeedbackSnapshot {
-                thread_id: "thread-a".to_string(),
-                title: "测试线程".to_string(),
-                timestamp: None,
-                text: "最终结果在这里。".to_string(),
-            }),
+            latest_feedback: Some(test_feedback_snapshot("thread-a")),
         };
 
+        assert!(should_notify_completion(&notification));
         let text = format_completion_notification(&notification);
         assert!(text.contains("线程正常完成"));
         assert!(text.contains("测试线程"));
@@ -1079,7 +1192,23 @@ mod tests {
     }
 
     #[test]
-    fn transcript_fallback_normal_completion_is_notified() {
+    fn completion_notification_without_thread_feedback_is_suppressed() {
+        let notification = CompletionNotification {
+            event: Some("Stop".to_string()),
+            session_id: Some("thread-a".to_string()),
+            turn_id: Some("turn-a".to_string()),
+            cwd: Some("/Users/gosu/.codex/memories".to_string()),
+            model: Some("gpt".to_string()),
+            source: "last_assistant_message".to_string(),
+            body: "Updated [MEMORY.md](/Users/gosu/.codex/memories/MEMORY.md).".to_string(),
+            latest_feedback: None,
+        };
+
+        assert!(!should_notify_completion(&notification));
+    }
+
+    #[test]
+    fn transcript_fallback_without_thread_feedback_is_not_notified() {
         let path = std::env::temp_dir().join(format!(
             "codex-sentinel-transcript-{}.jsonl",
             Utc::now().timestamp_nanos_opt().unwrap()
@@ -1114,7 +1243,7 @@ mod tests {
         assert_eq!(classification.source, "transcript_path");
         assert_eq!(
             stop_hook_action(&input, &AppConfig::default(), &classification, false),
-            "completed"
+            "none"
         );
 
         let _ = fs::remove_file(path);
@@ -1367,6 +1496,59 @@ mod tests {
         )
         .unwrap();
         assert!(stale.is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recent_hook_events_hide_stale_completion_without_feedback() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-sentinel-hook-events-{}.jsonl",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let ts = Utc.with_ymd_and_hms(2026, 5, 12, 1, 0, 0).unwrap();
+        let decision = RecoveryDecision::none();
+        let stale = json!({
+            "ts": ts,
+            "event": "Stop",
+            "action": "completed",
+            "event_key": "memory-thread:turn:None:hash",
+            "source": "last_assistant_message",
+            "session_id": "memory-thread",
+            "turn_id": "turn",
+            "decision": decision,
+            "body": "Updated [MEMORY.md](/Users/gosu/.codex/memories/MEMORY.md)."
+        });
+        let visible = json!({
+            "ts": ts + chrono::Duration::seconds(1),
+            "event": "Stop",
+            "action": "completed",
+            "event_key": "visible-thread:turn:None:hash",
+            "source": "last_assistant_message",
+            "session_id": "visible-thread",
+            "turn_id": "turn",
+            "decision": decision,
+            "body": "任务完成",
+            "latest_feedback": {
+                "thread_id": "visible-thread",
+                "title": "可见线程",
+                "timestamp": null,
+                "text": "任务完成"
+            }
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&stale).unwrap(),
+                serde_json::to_string(&visible).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let events = recent_hook_events_from_path(&path, 8).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("visible-thread"));
 
         let _ = fs::remove_file(path);
     }

@@ -24,7 +24,8 @@ const ROLLOUT_RECOVERY_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 const ROLLOUT_FEEDBACK_SCAN_BYTES: u64 = 1024 * 1024;
 const ROLLOUT_MAX_PARSE_LINE_BYTES: usize = 512 * 1024;
 const VISIBLE_SUBMIT_ATTEMPTS: usize = 4;
-const VISIBLE_SUBMIT_WAIT: Duration = Duration::from_secs(4);
+const VISIBLE_SUBMIT_WAIT: Duration = Duration::from_secs(8);
+const VISIBLE_SUBMIT_PROBE_GRACE_SECONDS: i64 = 2;
 const RECOVERY_LOG_TARGETS: &str = "(target IN ('codex_core::session::turn', 'codex_client::transport') \
           OR (target IN ('codex_otel.trace_safe', 'codex_otel.log_only') \
               AND feedback_log_body LIKE '%event.name=\"codex.sse_event\"%' \
@@ -1147,12 +1148,18 @@ pub fn continue_thread(thread_id: &str, prompt: &str) -> Result<String> {
     let baseline = read_thread_submit_marker(thread_id)?;
     desktop_control::prepare_existing_thread_visible(thread_id)?;
     let submit_baseline = read_thread_submit_marker(thread_id).unwrap_or(baseline.clone());
+    let submit_baseline_probe = app_server_probe::read_thread_probe(thread_id)
+        .ok()
+        .flatten();
 
     for attempt in 0..VISIBLE_SUBMIT_ATTEMPTS {
+        let attempt_started_at = Utc::now().timestamp();
         desktop_control::submit_prompt_to_visible_window(prompt, attempt)?;
-        if wait_for_thread_update(
+        if wait_for_thread_submission(
             thread_id,
             submit_baseline.updated_at_ms,
+            submit_baseline_probe.as_ref(),
+            attempt_started_at,
             VISIBLE_SUBMIT_WAIT,
         )? {
             return Ok(desktop_control::visible_turn_id());
@@ -1162,6 +1169,25 @@ pub fn continue_thread(thread_id: &str, prompt: &str) -> Result<String> {
     Err(anyhow!(
         "未能确认 Codex APP 已将追加指令写入线程 {thread_id}。请回到 Codex 窗口确认输入框是否有残留内容后重试。"
     ))
+}
+
+fn wait_for_thread_submission(
+    thread_id: &str,
+    baseline_updated_at_ms: i64,
+    baseline_probe: Option<&ThreadProbe>,
+    attempt_started_at: i64,
+    timeout: Duration,
+) -> Result<bool> {
+    if wait_for_thread_update(thread_id, baseline_updated_at_ms, timeout)? {
+        return Ok(true);
+    }
+
+    let probe = app_server_probe::read_thread_probe(thread_id)
+        .ok()
+        .flatten();
+    Ok(probe.as_ref().is_some_and(|probe| {
+        thread_probe_confirms_submission(probe, baseline_probe, attempt_started_at)
+    }))
 }
 
 pub fn start_new_thread(
@@ -1230,6 +1256,33 @@ fn wait_for_thread_update(
         std::thread::sleep(Duration::from_millis(240));
     }
     Ok(false)
+}
+
+fn thread_probe_confirms_submission(
+    probe: &ThreadProbe,
+    baseline: Option<&ThreadProbe>,
+    attempt_started_at: i64,
+) -> bool {
+    let fresh_after_attempt =
+        |ts: i64| ts >= attempt_started_at.saturating_sub(VISIBLE_SUBMIT_PROBE_GRACE_SECONDS);
+
+    if let Some(baseline) = baseline {
+        if probe.latest_turn_id.is_some() && probe.latest_turn_id != baseline.latest_turn_id {
+            return true;
+        }
+        if let Some(ts) = probe.latest_turn_ts() {
+            let baseline_ts = baseline.latest_turn_ts().unwrap_or(i64::MIN);
+            if ts > baseline_ts && fresh_after_attempt(ts) {
+                return true;
+            }
+            if probe.is_known_running() && !baseline.is_known_running() && fresh_after_attempt(ts) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    probe.latest_turn_ts().is_some_and(fresh_after_attempt)
 }
 
 #[derive(Debug, Clone)]
@@ -1319,6 +1372,23 @@ mod tests {
             );",
         )
         .expect("create logs table");
+    }
+
+    fn probe_with_turn(turn_id: &str, status: &str, started_at: i64) -> ThreadProbe {
+        ThreadProbe {
+            thread_id: "thread-a".to_string(),
+            thread_status: if status == "inProgress" {
+                Some("active".to_string())
+            } else {
+                Some("notLoaded".to_string())
+            },
+            latest_turn_id: Some(turn_id.to_string()),
+            latest_turn_status: Some(status.to_string()),
+            latest_turn_error: None,
+            latest_turn_started_at: Some(started_at),
+            latest_turn_completed_at: None,
+            source: "test".to_string(),
+        }
     }
 
     #[test]
@@ -1533,6 +1603,30 @@ mod tests {
 
         assert_eq!(selected.target, "codex_sentinel::rollout");
         assert_eq!(classify_error(&selected.body).kind, RecoveryKind::RetrySoon);
+    }
+
+    #[test]
+    fn submit_confirmation_accepts_new_app_server_turn() {
+        let baseline = probe_with_turn("turn-old", "completed", 1_778_560_000);
+        let current = probe_with_turn("turn-new", "inProgress", 1_778_560_050);
+
+        assert!(thread_probe_confirms_submission(
+            &current,
+            Some(&baseline),
+            1_778_560_049
+        ));
+    }
+
+    #[test]
+    fn submit_confirmation_rejects_stale_app_server_turn() {
+        let baseline = probe_with_turn("turn-old", "completed", 1_778_560_000);
+        let current = probe_with_turn("turn-old", "completed", 1_778_560_000);
+
+        assert!(!thread_probe_confirms_submission(
+            &current,
+            Some(&baseline),
+            1_778_560_049
+        ));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::{codex, config, control_queue, desktop_control};
 const TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS: u64 = 0;
 const TELEGRAM_EMPTY_POLL_SLEEP_SECONDS: u64 = 2;
 const TELEGRAM_HTTP_TIMEOUT_SECONDS: u64 = 12;
+const RECOVERY_FAILURE_BACKOFF_SECONDS: u64 = 60;
 
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
@@ -946,6 +947,9 @@ async fn recover_candidate(
         );
         return Ok(String::new());
     }
+    if automatic && counter.failure_backoff_active() {
+        return Ok(String::new());
+    }
     if !counter.can_run(max_attempts, cfg.watch.cooldown_seconds) {
         tracing::info!(
             thread_id = %thread.id,
@@ -961,28 +965,41 @@ async fn recover_candidate(
     }
 
     if automatic {
-        match desktop_control::inspect_thread_failure_state(&thread.id)? {
-            desktop_control::VisibleThreadFailureState::Failed => {
+        match desktop_control::inspect_thread_failure_state(&thread.id) {
+            Ok(desktop_control::VisibleThreadFailureState::Failed) => {
                 tracing::info!(
                     thread_id = %thread.id,
                     label = %decision.label,
                     "visible Codex error marker confirmed before automatic recovery"
                 );
             }
-            desktop_control::VisibleThreadFailureState::StoppedMarker => {
+            Ok(desktop_control::VisibleThreadFailureState::StoppedMarker) => {
                 tracing::info!(
                     thread_id = %thread.id,
                     label = %decision.label,
                     "visible Codex stopped marker confirmed with terminal recovery event before automatic recovery"
                 );
             }
-            desktop_control::VisibleThreadFailureState::NotFailed => {
+            Ok(desktop_control::VisibleThreadFailureState::NotFailed) => {
                 tracing::info!(
                     thread_id = %thread.id,
                     label = %decision.label,
                     "automatic recovery skipped because Codex UI does not show a failure or stopped marker"
                 );
                 return Ok(String::new());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    thread_id = %thread.id,
+                    label = %decision.label,
+                    error = %err,
+                    "automatic visible recovery deferred because Codex window could not be inspected"
+                );
+                counter.record_failure();
+                return Ok(format!(
+                    "自动恢复暂缓\n线程：{}\n原因：无法确认 Codex 可见窗口状态：{}\n请唤醒/解锁屏幕后再试。",
+                    thread.id, err
+                ));
             }
         }
     }
@@ -997,10 +1014,25 @@ async fn recover_candidate(
         label = %decision.label,
         "sending recovery continue prompt"
     );
-    let response = control_queue::submit_and_wait(control_queue::ControlAction::Continue {
+    let response = match control_queue::submit_and_wait(control_queue::ControlAction::Continue {
         thread_id: thread.id.clone(),
         prompt,
-    })?;
+    }) {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(
+                thread_id = %thread.id,
+                label = %decision.label,
+                error = %err,
+                "automatic visible recovery failed while sending continue prompt"
+            );
+            counter.record_failure();
+            return Ok(format!(
+                "自动恢复暂缓\n线程：{}\n原因：发送追加指令失败：{}\n请在 Codex APP 可见窗口内重试。",
+                thread.id, err
+            ));
+        }
+    };
     counter.record(event_key);
     let turn = response.turn_id.unwrap_or_default();
     tracing::info!(
@@ -1020,11 +1052,18 @@ struct RecoveryCounter {
     count: u32,
     last_run: Option<Instant>,
     last_event_key: Option<String>,
+    last_failure: Option<Instant>,
 }
 
 impl RecoveryCounter {
     fn already_handled(&self, event_key: Option<&str>) -> bool {
         event_key.is_some_and(|key| self.last_event_key.as_deref() == Some(key))
+    }
+
+    fn failure_backoff_active(&self) -> bool {
+        self.last_failure.is_some_and(|last| {
+            last.elapsed() < Duration::from_secs(RECOVERY_FAILURE_BACKOFF_SECONDS)
+        })
     }
 
     fn can_run(&self, max: u32, cooldown_seconds: u64) -> bool {
@@ -1041,6 +1080,12 @@ impl RecoveryCounter {
         self.count += 1;
         self.last_run = Some(Instant::now());
         self.last_event_key = event_key.map(str::to_string);
+        self.last_failure = None;
+    }
+
+    fn record_failure(&mut self) {
+        self.last_run = Some(Instant::now());
+        self.last_failure = Some(Instant::now());
     }
 }
 
@@ -1238,6 +1283,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn normalizes_group_commands_with_bot_suffix() {
@@ -1254,5 +1300,29 @@ mod tests {
     #[test]
     fn pair_text_matches_plain_code() {
         assert!(pair_text_matches("123456", "123456"));
+    }
+
+    #[test]
+    fn automatic_recovery_failure_backoff_only_applies_to_automatic_runs() {
+        let counter = RecoveryCounter {
+            count: 0,
+            last_run: Some(Instant::now() - Duration::from_secs(10)),
+            last_event_key: None,
+            last_failure: Some(Instant::now()),
+        };
+
+        assert!(counter.failure_backoff_active());
+        assert!(counter.can_run(10, 5));
+
+        let counter = RecoveryCounter {
+            count: 0,
+            last_run: Some(Instant::now() - Duration::from_secs(10)),
+            last_event_key: None,
+            last_failure: Some(
+                Instant::now() - Duration::from_secs(RECOVERY_FAILURE_BACKOFF_SECONDS + 1),
+            ),
+        };
+        assert!(!counter.failure_backoff_active());
+        assert!(counter.can_run(10, 5));
     }
 }

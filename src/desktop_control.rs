@@ -18,6 +18,19 @@ use image::GenericImageView;
 use serde::Serialize;
 
 #[cfg(target_os = "macos")]
+const EXISTING_THREAD_OPEN_SETTLE: Duration = Duration::from_millis(2_200);
+#[cfg(target_os = "macos")]
+const COMPOSER_AFTER_FOCUS_SETTLE: Duration = Duration::from_millis(220);
+#[cfg(target_os = "macos")]
+const COMPOSER_AFTER_CLEAR_SETTLE: Duration = Duration::from_millis(120);
+#[cfg(target_os = "macos")]
+const COMPOSER_AFTER_INSERT_SETTLE: Duration = Duration::from_millis(260);
+#[cfg(target_os = "macos")]
+const POST_SEND_SETTLE: Duration = Duration::from_millis(520);
+#[cfg(target_os = "macos")]
+const PASTEBOARD_SETTLE: Duration = Duration::from_millis(120);
+
+#[cfg(target_os = "macos")]
 use core_foundation::base::{CFType, TCFType};
 #[cfg(target_os = "macos")]
 use core_foundation::boolean::CFBoolean;
@@ -225,13 +238,14 @@ fn submit_prompt_to_current_codex_window(
         click_at(window.pid, point.x, point.y)?;
         std::thread::sleep(Duration::from_millis(90));
     }
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(COMPOSER_AFTER_FOCUS_SETTLE);
 
     clear_current_input(window.pid)?;
+    std::thread::sleep(COMPOSER_AFTER_CLEAR_SETTLE);
     insert_prompt_text(window.pid, prompt, attempt)?;
-    std::thread::sleep(Duration::from_millis(120));
+    std::thread::sleep(COMPOSER_AFTER_INSERT_SETTLE);
     trigger_send(&window, attempt, placement)?;
-    std::thread::sleep(Duration::from_millis(360));
+    std::thread::sleep(POST_SEND_SETTLE);
     Ok(())
 }
 
@@ -258,7 +272,8 @@ fn open_codex_thread(thread_id: &str) -> Result<()> {
     let uri = format!("codex://threads/{thread_id}");
     open_codex_uri(&uri)?;
     activate_codex_app()?;
-    std::thread::sleep(Duration::from_millis(1_400));
+    wait_for_codex_window(Duration::from_secs(4))?;
+    std::thread::sleep(EXISTING_THREAD_OPEN_SETTLE);
     Ok(())
 }
 
@@ -927,20 +942,20 @@ fn new_thread_send_button_point(window: &CodexWindow, attempt: usize) -> CGPoint
 #[cfg(target_os = "macos")]
 fn trigger_send(window: &CodexWindow, attempt: usize, placement: ComposerPlacement) -> Result<()> {
     if matches!(placement, ComposerPlacement::ExistingThread) {
-        match attempt % 4 {
-            0 | 1 => {
-                let point = send_button_point(window, attempt, placement);
-                click_at(window.pid, point.x, point.y)?;
-            }
-            2 => {
-                post_key_press(window.pid, KeyCode::RETURN, CGEventFlags::empty())?;
-            }
-            _ => {
+        match existing_thread_send_method(attempt) {
+            ExistingThreadSendMethod::CommandReturn => {
                 post_key_press(
                     window.pid,
                     KeyCode::RETURN,
                     CGEventFlags::CGEventFlagCommand,
                 )?;
+            }
+            ExistingThreadSendMethod::SendButton => {
+                let point = send_button_point(window, attempt, placement);
+                click_at(window.pid, point.x, point.y)?;
+            }
+            ExistingThreadSendMethod::Return => {
+                post_key_press(window.pid, KeyCode::RETURN, CGEventFlags::empty())?;
             }
         }
         return Ok(());
@@ -965,6 +980,23 @@ fn trigger_send(window: &CodexWindow, attempt: usize, placement: ComposerPlaceme
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingThreadSendMethod {
+    CommandReturn,
+    SendButton,
+    Return,
+}
+
+#[cfg(target_os = "macos")]
+fn existing_thread_send_method(attempt: usize) -> ExistingThreadSendMethod {
+    match attempt % 4 {
+        0 => ExistingThreadSendMethod::CommandReturn,
+        1 | 2 => ExistingThreadSendMethod::SendButton,
+        _ => ExistingThreadSendMethod::Return,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1055,13 +1087,31 @@ fn clear_current_input(pid: i32) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn insert_prompt_text(pid: i32, prompt: &str, attempt: usize) -> Result<()> {
-    if attempt % 2 == 0 {
-        write_clipboard(prompt.as_bytes())?;
-        post_command_v(pid)?;
-    } else {
-        type_unicode_text(pid, prompt)?;
+    match text_input_method(attempt) {
+        TextInputMethod::Unicode => type_unicode_text(pid, prompt)?,
+        TextInputMethod::ClipboardPaste => {
+            write_clipboard(prompt.as_bytes())?;
+            std::thread::sleep(PASTEBOARD_SETTLE);
+            post_command_v(pid)?;
+        }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextInputMethod {
+    Unicode,
+    ClipboardPaste,
+}
+
+#[cfg(target_os = "macos")]
+fn text_input_method(attempt: usize) -> TextInputMethod {
+    match attempt % 4 {
+        0 | 1 => TextInputMethod::Unicode,
+        2 => TextInputMethod::ClipboardPaste,
+        _ => TextInputMethod::Unicode,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1168,6 +1218,34 @@ mod tests {
         let state = image_thread_failure_state(path, 2.0).expect("inspect fixture");
         let _ = std::fs::remove_file(path);
         state
+    }
+
+    #[test]
+    fn visible_submit_prefers_unicode_before_clipboard_fallback() {
+        assert_eq!(text_input_method(0), TextInputMethod::Unicode);
+        assert_eq!(text_input_method(1), TextInputMethod::Unicode);
+        assert_eq!(text_input_method(2), TextInputMethod::ClipboardPaste);
+        assert_eq!(text_input_method(3), TextInputMethod::Unicode);
+    }
+
+    #[test]
+    fn existing_thread_submit_prefers_command_return_before_click_fallbacks() {
+        assert_eq!(
+            existing_thread_send_method(0),
+            ExistingThreadSendMethod::CommandReturn
+        );
+        assert_eq!(
+            existing_thread_send_method(1),
+            ExistingThreadSendMethod::SendButton
+        );
+        assert_eq!(
+            existing_thread_send_method(2),
+            ExistingThreadSendMethod::SendButton
+        );
+        assert_eq!(
+            existing_thread_send_method(3),
+            ExistingThreadSendMethod::Return
+        );
     }
 
     #[test]
