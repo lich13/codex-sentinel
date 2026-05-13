@@ -696,7 +696,9 @@ pub fn latest_assistant_text_from_rollout_path(
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if let Some(text) = assistant_message_text(&value) {
+        if let Some(text) =
+            task_complete_feedback_text(&value).or_else(|| assistant_message_text(&value))
+        {
             return Ok(Some((
                 value
                     .get("timestamp")
@@ -910,6 +912,39 @@ fn assistant_message_text(value: &Value) -> Option<String> {
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_string);
+    }
+
+    None
+}
+
+fn task_complete_feedback_text(value: &Value) -> Option<String> {
+    let payload = value.get("payload")?;
+    if value.get("type").and_then(Value::as_str) != Some("event_msg")
+        || payload.get("type").and_then(Value::as_str) != Some("task_complete")
+    {
+        return None;
+    }
+
+    if let Some(text) = payload
+        .get("last_agent_message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_string());
+    }
+
+    if payload
+        .get("last_agent_message")
+        .is_some_and(Value::is_null)
+    {
+        let turn_id = payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        return Some(format!(
+            "最近一次 turn 已完成，但没有产生最终 assistant 反馈。\n\nturn_id: {turn_id}\n这通常表示 Codex 在安全拦截、异常中断或静默完成时终止；请查看恢复事件或继续一次确认实际状态。"
+        ));
     }
 
     None
@@ -1528,6 +1563,64 @@ mod tests {
         });
 
         assert_eq!(assistant_message_text(&value).as_deref(), Some("最后反馈"));
+    }
+
+    #[test]
+    fn latest_feedback_prefers_silent_task_completion_over_stale_message() {
+        let path = temp_db_path("feedback-silent-task").with_extension("jsonl");
+        let raw = [
+            serde_json::to_string(&json!({
+                "timestamp": "2026-05-09T17:26:08.291Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "语法检查通过，继续验证。",
+                    "phase": "commentary"
+                }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "timestamp": "2026-05-09T17:27:04.514Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-silent",
+                    "last_agent_message": null,
+                    "completed_at": 1778606824
+                }
+            }))
+            .unwrap(),
+        ]
+        .join("\n");
+        fs::write(&path, raw).expect("write rollout");
+
+        let (_, text) = latest_assistant_text_from_rollout_path(&path)
+            .expect("feedback lookup succeeds")
+            .expect("feedback found");
+        assert!(text.contains("没有产生最终 assistant 反馈"));
+        assert!(text.contains("turn-silent"));
+        assert!(!text.contains("语法检查通过"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn latest_feedback_reads_task_complete_final_message() {
+        let value = json!({
+            "timestamp": "2026-05-09T17:27:04.514Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "turn-ok",
+                "last_agent_message": "最终反馈。",
+                "completed_at": 1778606824
+            }
+        });
+
+        assert_eq!(
+            task_complete_feedback_text(&value).as_deref(),
+            Some("最终反馈。")
+        );
     }
 
     #[test]
