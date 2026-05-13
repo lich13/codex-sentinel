@@ -406,6 +406,11 @@ button:active {
   font-size: 12px !important;
 }
 
+.feedback-box.muted-box {
+  border-color: var(--line-soft);
+  background: var(--surface-soft);
+}
+
 .config-list {
   display: grid;
   gap: 0;

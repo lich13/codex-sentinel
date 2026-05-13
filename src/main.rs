@@ -5,6 +5,7 @@ mod control_queue;
 mod desktop_control;
 mod hooks;
 mod lifecycle;
+mod maintenance;
 mod recovery;
 mod telegram;
 mod ui;

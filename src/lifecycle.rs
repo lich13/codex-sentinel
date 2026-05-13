@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use sysinfo::{ProcessStatus, System};
 
-use crate::config;
+use crate::{config, maintenance};
 
 const LABEL: &str = "local.codex-sentinel";
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -50,6 +50,7 @@ pub fn run_lifecycle() -> Result<()> {
     tracing::info!("Codex Sentinel lifecycle helper started");
 
     loop {
+        trim_runtime_files_once();
         let snapshot = inspect_processes()?;
         if snapshot.codex_running {
             ensure_gui_running(&snapshot)?;
@@ -154,6 +155,7 @@ fn spawn_role_process(
 ) -> Result<()> {
     let exe = current_exe()?;
     fs::create_dir_all(config::config_dir())?;
+    trim_runtime_files_once();
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
@@ -171,6 +173,18 @@ fn spawn_role_process(
         .with_context(|| format!("failed to start {role} from {}", exe.display()))?;
     tracing::info!(pid = child.id(), role, "{message}");
     Ok(())
+}
+
+fn trim_runtime_files_once() {
+    let cfg = config::load_or_create().unwrap_or_default();
+    if let Err(err) = maintenance::trim_runtime_files(&cfg) {
+        tracing::debug!("failed to trim runtime files: {err:#}");
+    }
+    if let Err(err) = maintenance::prune_cleared_rollout_backups(
+        cfg.observability.cleared_rollout_backup_max_bytes,
+    ) {
+        tracing::debug!("failed to prune cleared archived rollout backups: {err:#}");
+    }
 }
 
 fn stop_followed_processes(snapshot: &ProcessSnapshot) -> Result<()> {

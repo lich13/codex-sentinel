@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use crate::{codex, config, lifecycle};
+use crate::{codex, config, lifecycle, maintenance};
 
 const REQUESTS_FILE: &str = "control-requests.jsonl";
 const RESPONSES_FILE: &str = "control-responses.jsonl";
@@ -261,6 +261,10 @@ fn append_json_line_locked<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     file.write_all(line.as_bytes())?;
     file.write_all(b"\n")?;
     file.flush()?;
+    let max_lines = config::load_or_create()
+        .map(|cfg| cfg.observability.control_queue_max_lines)
+        .unwrap_or_else(|_| config::ObservabilityConfig::default().control_queue_max_lines);
+    maintenance::trim_jsonl_file(path, max_lines)?;
     Ok(())
 }
 

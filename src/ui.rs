@@ -11,7 +11,7 @@ use tauri::menu::{CheckMenuItem, MenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{Manager, WindowEvent};
 
-use crate::{codex, config, control_queue, desktop_control, hooks};
+use crate::{codex, config, control_queue, desktop_control, hooks, maintenance};
 
 const TRAY_ID: &str = "main";
 const TRAY_MENU_SHOW: &str = "tray-show";
@@ -50,6 +50,14 @@ struct ConfigSummary {
     continue_prompt: String,
     tool_failure_prompt: String,
     safety_rephrase_prompt: String,
+    latest_feedback_enabled: bool,
+    completion_notifications_enabled: bool,
+    record_normal_completion_events: bool,
+    hook_event_max_lines: usize,
+    hook_cooldown_max_lines: usize,
+    control_queue_max_lines: usize,
+    log_max_bytes: u64,
+    cleared_rollout_backup_max_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +76,14 @@ struct RuntimeSettingsInput {
     continue_prompt: String,
     tool_failure_prompt: String,
     safety_rephrase_prompt: String,
+    latest_feedback_enabled: bool,
+    completion_notifications_enabled: bool,
+    record_normal_completion_events: bool,
+    hook_event_max_lines: usize,
+    hook_cooldown_max_lines: usize,
+    control_queue_max_lines: usize,
+    log_max_bytes: u64,
+    cleared_rollout_backup_max_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -408,6 +424,21 @@ fn save_runtime_settings(
     if input.continue_prompt.trim().is_empty() {
         return Err("默认续跑指令不能为空".to_string());
     }
+    if input.hook_event_max_lines < 50 {
+        return Err("Hook 事件保留行数不能小于 50".to_string());
+    }
+    if input.hook_cooldown_max_lines < 50 {
+        return Err("Hook 冷却保留行数不能小于 50".to_string());
+    }
+    if input.control_queue_max_lines < 50 {
+        return Err("控制队列保留行数不能小于 50".to_string());
+    }
+    if input.log_max_bytes < 1024 * 1024 {
+        return Err("后台日志上限不能小于 1MB".to_string());
+    }
+    if input.cleared_rollout_backup_max_bytes < 100 * 1024 * 1024 {
+        return Err("清归档备份上限不能小于 100MB".to_string());
+    }
     let mut cfg = config::load_or_create().map_err(format_error)?;
     cfg.watch.enabled = input.watch_enabled;
     cfg.watch.poll_interval_seconds = input.poll_interval_seconds;
@@ -417,7 +448,25 @@ fn save_runtime_settings(
     cfg.recovery.continue_prompt = input.continue_prompt.trim().to_string();
     cfg.recovery.tool_failure_prompt = input.tool_failure_prompt.trim().to_string();
     cfg.recovery.safety_rephrase_prompt = input.safety_rephrase_prompt.trim().to_string();
+    cfg.observability.latest_feedback_enabled = input.latest_feedback_enabled;
+    cfg.observability.completion_notifications_enabled = input.completion_notifications_enabled;
+    cfg.observability.record_normal_completion_events = input.record_normal_completion_events;
+    cfg.observability.hook_event_max_lines = input.hook_event_max_lines;
+    cfg.observability.hook_cooldown_max_lines = input.hook_cooldown_max_lines;
+    cfg.observability.control_queue_max_lines = input.control_queue_max_lines;
+    cfg.observability.log_max_bytes = input.log_max_bytes;
+    cfg.observability.cleared_rollout_backup_max_bytes = input.cleared_rollout_backup_max_bytes;
     config::save(&cfg).map_err(format_error)?;
+    if let Err(err) = maintenance::trim_runtime_files(&cfg) {
+        tracing::debug!("failed to trim runtime files after settings save: {err:#}");
+    }
+    if let Err(err) = maintenance::prune_cleared_rollout_backups(
+        cfg.observability.cleared_rollout_backup_max_bytes,
+    ) {
+        tracing::debug!(
+            "failed to prune cleared archived rollout backups after settings save: {err:#}"
+        );
+    }
     load_dashboard().map_err(format_error)
 }
 
@@ -619,6 +668,8 @@ fn start_telegram_daemon() -> std::result::Result<DaemonStartResult, String> {
     let log_path = daemon_log_path();
     let err_path = config::config_dir().join("telegram-daemon.err.log");
     std::fs::create_dir_all(config::config_dir()).map_err(format_error)?;
+    let cfg = config::load_or_create().map_err(format_error)?;
+    maintenance::trim_runtime_files(&cfg).map_err(format_error)?;
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
@@ -669,10 +720,14 @@ fn open_desktop_permissions() -> std::result::Result<DashboardPayload, String> {
 fn load_dashboard() -> Result<DashboardPayload> {
     let cfg = config::load_or_create()?;
     let status = codex::collect_status()?;
-    let active_feedback = status
-        .recent_threads
-        .first()
-        .and_then(|thread| codex::latest_thread_feedback_for(thread).ok());
+    let active_feedback = if cfg.observability.latest_feedback_enabled {
+        status
+            .recent_threads
+            .first()
+            .and_then(|thread| codex::latest_thread_feedback_for(thread).ok())
+    } else {
+        None
+    };
     Ok(DashboardPayload {
         config: summarize_config(&cfg),
         hooks: hooks::inspect_hooks()?,
@@ -700,6 +755,14 @@ fn summarize_config(cfg: &config::AppConfig) -> ConfigSummary {
         continue_prompt: cfg.recovery.continue_prompt.clone(),
         tool_failure_prompt: cfg.recovery.tool_failure_prompt.clone(),
         safety_rephrase_prompt: cfg.recovery.safety_rephrase_prompt.clone(),
+        latest_feedback_enabled: cfg.observability.latest_feedback_enabled,
+        completion_notifications_enabled: cfg.observability.completion_notifications_enabled,
+        record_normal_completion_events: cfg.observability.record_normal_completion_events,
+        hook_event_max_lines: cfg.observability.hook_event_max_lines,
+        hook_cooldown_max_lines: cfg.observability.hook_cooldown_max_lines,
+        control_queue_max_lines: cfg.observability.control_queue_max_lines,
+        log_max_bytes: cfg.observability.log_max_bytes,
+        cleared_rollout_backup_max_bytes: cfg.observability.cleared_rollout_backup_max_bytes,
     }
 }
 

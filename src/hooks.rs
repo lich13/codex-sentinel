@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::codex;
 use crate::config::{self, AppConfig};
+use crate::maintenance;
 use crate::recovery::{RecoveryDecision, RecoveryKind, classify_error, sanitized_recovery_text};
 use crate::telegram;
 
@@ -22,6 +23,7 @@ const STOP_HOOK_MAX_INLINE_DELAY_SECONDS: u64 = 10;
 const STOP_HOOK_DEDUP_WINDOW_SECONDS: i64 = 300;
 const STOP_HOOK_COMPLETION_DEDUP_WINDOW_SECONDS: i64 = 300;
 const RECENT_HOOK_EVENT_LIMIT: usize = 5;
+const HOOK_EVENTS_TAIL_SCAN_BYTES: u64 = 512 * 1024;
 const INSTALLED_APP_EXECUTABLE: &str =
     "/Applications/Codex Sentinel.app/Contents/MacOS/codex-sentinel";
 
@@ -86,6 +88,12 @@ struct HookEventLine {
     decision: Option<RecoveryDecision>,
     body: Option<String>,
     latest_feedback: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HookCooldownLine {
+    ts: DateTime<Utc>,
+    event_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -204,12 +212,11 @@ pub fn install_hooks() -> Result<HookInstallResult> {
 pub fn run_stop_hook_from_stdin() -> Result<()> {
     let input = read_hook_input()?;
     let cfg = config::load_or_create().unwrap_or_default();
-    let classification = classify_stop_input(&input);
+    let collect_latest_feedback = should_collect_latest_feedback(&cfg);
+    let classification = classify_stop_input_with_feedback(&input, collect_latest_feedback);
     let body_hash = stable_hash_hex(&[&classification.body]);
     let event_key = stop_event_key(&input, &classification, &body_hash);
-    let duplicate = recent_event_with_key(&event_key, STOP_HOOK_DEDUP_WINDOW_SECONDS)
-        .unwrap_or(None)
-        .is_some();
+    let duplicate = recent_key_seen(&event_key, STOP_HOOK_DEDUP_WINDOW_SECONDS).unwrap_or(false);
     let response = stop_hook_response(
         &input,
         &cfg,
@@ -219,21 +226,32 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
     )?;
     let action = stop_hook_action(&input, &cfg, &classification, duplicate);
     let completion_duplicate = if action == "completed" {
-        recent_event_with_key(&event_key, STOP_HOOK_COMPLETION_DEDUP_WINDOW_SECONDS)
-            .unwrap_or(None)
-            .is_some()
+        recent_key_seen(&event_key, STOP_HOOK_COMPLETION_DEDUP_WINDOW_SECONDS).unwrap_or(false)
     } else {
         false
     };
 
-    if should_log_stop_event(&classification, action) {
-        if let Err(err) =
-            log_stop_hook_event(&input, &classification, action, &body_hash, &event_key)
-        {
+    if should_log_stop_event(&cfg, &classification, action) {
+        if let Err(err) = log_stop_hook_event(
+            &cfg,
+            &input,
+            &classification,
+            action,
+            &body_hash,
+            &event_key,
+        ) {
             tracing::warn!("failed to write Stop hook event: {err:#}");
         }
     }
-    if action == "completed" && !completion_duplicate {
+    if should_write_cooldown_key(&classification, action) {
+        if let Err(err) = append_hook_cooldown_key(&cfg, &event_key) {
+            tracing::warn!("failed to write Stop hook cooldown key: {err:#}");
+        }
+    }
+    if action == "completed"
+        && cfg.observability.completion_notifications_enabled
+        && !completion_duplicate
+    {
         if let Err(err) = spawn_completion_notification(&input, &classification) {
             tracing::warn!("failed to spawn completion notification: {err:#}");
         }
@@ -244,7 +262,8 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
 
 pub async fn run_notify_completion_from_stdin() -> Result<()> {
     let notification = read_completion_notification()?;
-    if !should_notify_completion(&notification) {
+    let cfg = config::load_or_create().unwrap_or_default();
+    if !should_notify_completion(&cfg, &notification) {
         tracing::debug!(
             session_id = ?notification.session_id,
             turn_id = ?notification.turn_id,
@@ -252,7 +271,6 @@ pub async fn run_notify_completion_from_stdin() -> Result<()> {
         );
         return Ok(());
     }
-    let cfg = config::load_or_create().unwrap_or_default();
     let text = format_completion_notification(&notification);
     telegram::notify_configured_text_with_keyboard(
         &cfg,
@@ -262,20 +280,42 @@ pub async fn run_notify_completion_from_stdin() -> Result<()> {
     .await
 }
 
+#[cfg(test)]
 fn classify_stop_input(input: &HookInput) -> StopClassification {
+    classify_stop_input_with_feedback(input, true)
+}
+
+fn classify_stop_input_with_feedback(
+    input: &HookInput,
+    collect_latest_feedback: bool,
+) -> StopClassification {
     let message = input.last_assistant_message.as_deref().unwrap_or_default();
     let decision = classify_stop_assistant_text(message);
     if decision.kind != RecoveryKind::None {
-        return stop_classification(input, decision, "last_assistant_message", message);
+        return stop_classification_with_feedback(
+            input,
+            decision,
+            "last_assistant_message",
+            message,
+            collect_latest_feedback,
+        );
     }
     if !message.trim().is_empty() {
-        return stop_classification(input, decision, "last_assistant_message", message);
+        return stop_classification_with_feedback(
+            input,
+            decision,
+            "last_assistant_message",
+            message,
+            collect_latest_feedback,
+        );
     }
 
     let transcript_message = latest_transcript_message(input);
     let prefer_log_fallback = should_prefer_log_fallback(input);
     if prefer_log_fallback {
-        if let Some(classification) = classify_stop_from_log(input, &decision) {
+        if let Some(classification) =
+            classify_stop_from_log(input, &decision, collect_latest_feedback)
+        {
             return classification;
         }
     }
@@ -283,26 +323,35 @@ fn classify_stop_input(input: &HookInput) -> StopClassification {
     if let Some(transcript_message) = transcript_message.as_deref() {
         let transcript_decision = classify_stop_assistant_text(transcript_message);
         if transcript_decision.kind != RecoveryKind::None {
-            return stop_classification(
+            return stop_classification_with_feedback(
                 input,
                 transcript_decision,
                 "transcript_path",
                 transcript_message,
+                collect_latest_feedback,
             );
         }
     }
 
     if !prefer_log_fallback {
-        if let Some(classification) = classify_stop_from_log(input, &decision) {
+        if let Some(classification) =
+            classify_stop_from_log(input, &decision, collect_latest_feedback)
+        {
             return classification;
         }
     }
 
     if let Some(transcript_message) = transcript_message {
-        return stop_classification(input, decision, "transcript_path", &transcript_message);
+        return stop_classification_with_feedback(
+            input,
+            decision,
+            "transcript_path",
+            &transcript_message,
+            collect_latest_feedback,
+        );
     }
 
-    stop_classification(input, decision, "empty", message)
+    stop_classification_with_feedback(input, decision, "empty", message, collect_latest_feedback)
 }
 
 fn classify_stop_assistant_text(text: &str) -> RecoveryDecision {
@@ -316,6 +365,7 @@ fn classify_stop_assistant_text(text: &str) -> RecoveryDecision {
 fn classify_stop_from_log(
     input: &HookInput,
     base_decision: &RecoveryDecision,
+    collect_latest_feedback: bool,
 ) -> Option<StopClassification> {
     match codex::latest_recovery_log_for_hook(
         input.session_id.as_deref(),
@@ -325,22 +375,24 @@ fn classify_stop_from_log(
         Ok(Some(event)) => {
             let fallback_decision = classify_error(&event.body);
             if fallback_decision.kind != RecoveryKind::None {
-                return Some(stop_classification(
+                return Some(stop_classification_with_feedback(
                     input,
                     fallback_decision,
                     "codex_log_fallback",
                     &event.body,
+                    collect_latest_feedback,
                 ));
             }
         }
         Ok(None) => {}
         Err(err) => {
             let source = format!("Stop hook log fallback failed: {err:#}");
-            return Some(stop_classification(
+            return Some(stop_classification_with_feedback(
                 input,
                 base_decision.clone(),
                 "log_lookup_error",
                 &source,
+                collect_latest_feedback,
             ));
         }
     }
@@ -354,13 +406,26 @@ fn should_prefer_log_fallback(input: &HookInput) -> bool {
         .is_some_and(|turn_id| !turn_id.trim().is_empty())
 }
 
+#[cfg(test)]
 fn stop_classification(
     input: &HookInput,
     decision: RecoveryDecision,
     source: &str,
     body: &str,
 ) -> StopClassification {
-    let latest_feedback = if decision.kind != RecoveryKind::None || !body.trim().is_empty() {
+    stop_classification_with_feedback(input, decision, source, body, true)
+}
+
+fn stop_classification_with_feedback(
+    input: &HookInput,
+    decision: RecoveryDecision,
+    source: &str,
+    body: &str,
+    collect_latest_feedback: bool,
+) -> StopClassification {
+    let latest_feedback = if collect_latest_feedback
+        && (decision.kind != RecoveryKind::None || !body.trim().is_empty())
+    {
         latest_feedback_snapshot(input)
     } else {
         None
@@ -371,6 +436,12 @@ fn stop_classification(
         body: body.to_string(),
         latest_feedback,
     }
+}
+
+fn should_collect_latest_feedback(cfg: &AppConfig) -> bool {
+    cfg.observability.latest_feedback_enabled
+        || cfg.observability.completion_notifications_enabled
+        || cfg.observability.record_normal_completion_events
 }
 
 fn latest_transcript_message(input: &HookInput) -> Option<String> {
@@ -768,13 +839,21 @@ fn is_machine_control_payload(text: &str) -> bool {
             .any(|key| matches!(key.as_str(), "suggestions" | "exclude"))
 }
 
-fn should_log_stop_event(classification: &StopClassification, action: &str) -> bool {
+fn should_log_stop_event(
+    cfg: &AppConfig,
+    classification: &StopClassification,
+    action: &str,
+) -> bool {
+    if action == "completed" {
+        return cfg.observability.record_normal_completion_events;
+    }
     classification.decision.kind != RecoveryKind::None
         || action != "none"
         || classification.source == "log_lookup_error"
 }
 
 fn log_stop_hook_event(
+    cfg: &AppConfig,
     input: &HookInput,
     classification: &StopClassification,
     action: &str,
@@ -799,7 +878,13 @@ fn log_stop_hook_event(
         "body": truncate(&classification.body, 1600),
         "latest_feedback": &classification.latest_feedback
     });
-    append_hook_event(&line)
+    append_hook_event(&line, cfg.observability.hook_event_max_lines)
+}
+
+fn should_write_cooldown_key(classification: &StopClassification, action: &str) -> bool {
+    action != "none"
+        || classification.decision.kind != RecoveryKind::None
+        || classification.source == "log_lookup_error"
 }
 
 fn stop_event_key(
@@ -837,7 +922,7 @@ fn stable_hash_hex(parts: &[&str]) -> String {
     format!("{hash:016x}")
 }
 
-fn append_hook_event(line: &Value) -> Result<()> {
+fn append_hook_event(line: &Value, max_lines: usize) -> Result<()> {
     let dir = config::config_dir();
     fs::create_dir_all(&dir)?;
     let path = hook_events_path();
@@ -846,13 +931,37 @@ fn append_hook_event(line: &Value) -> Result<()> {
     fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)?
+        .open(&path)?
         .write_all(raw.as_bytes())?;
+    maintenance::trim_jsonl_file(&path, max_lines)?;
     Ok(())
 }
 
 fn hook_events_path() -> PathBuf {
     config::config_dir().join("hook-events.jsonl")
+}
+
+fn hook_cooldowns_path() -> PathBuf {
+    config::config_dir().join("hook-cooldowns.jsonl")
+}
+
+fn append_hook_cooldown_key(cfg: &AppConfig, event_key: &str) -> Result<()> {
+    let dir = config::config_dir();
+    fs::create_dir_all(&dir)?;
+    let path = hook_cooldowns_path();
+    let line = json!({
+        "ts": Utc::now(),
+        "event_key": event_key
+    });
+    let mut raw = serde_json::to_string(&line)?;
+    raw.push('\n');
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?
+        .write_all(raw.as_bytes())?;
+    maintenance::trim_jsonl_file(&path, cfg.observability.hook_cooldown_max_lines)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -904,8 +1013,8 @@ fn read_completion_notification() -> Result<CompletionNotification> {
     serde_json::from_str(&raw).context("failed to parse completion notification JSON from stdin")
 }
 
-fn should_notify_completion(notification: &CompletionNotification) -> bool {
-    notification.latest_feedback.is_some()
+fn should_notify_completion(cfg: &AppConfig, notification: &CompletionNotification) -> bool {
+    cfg.observability.completion_notifications_enabled && notification.latest_feedback.is_some()
 }
 
 fn format_completion_notification(notification: &CompletionNotification) -> String {
@@ -964,10 +1073,8 @@ fn recent_hook_events_from_path(path: &Path, limit: usize) -> Result<Vec<HookEve
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let file = fs::File::open(path)?;
     let mut events = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
+    for line in read_tail_lines(path, HOOK_EVENTS_TAIL_SCAN_BYTES)? {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -992,8 +1099,51 @@ fn is_stale_completion_event_without_feedback(event: &HookEventLine) -> bool {
     event.action == "completed" && event.latest_feedback.is_none()
 }
 
-fn recent_event_with_key(key: &str, max_age_seconds: i64) -> Result<Option<HookEventSummary>> {
-    recent_event_with_key_from_events(recent_hook_events(64)?, key, max_age_seconds, Utc::now())
+fn recent_key_seen(key: &str, max_age_seconds: i64) -> Result<bool> {
+    let now = Utc::now();
+    if recent_cooldown_key_seen(key, max_age_seconds, now)? {
+        return Ok(true);
+    }
+    Ok(
+        recent_event_with_key_from_events(recent_hook_events(64)?, key, max_age_seconds, now)?
+            .is_some(),
+    )
+}
+
+fn recent_cooldown_key_seen(key: &str, max_age_seconds: i64, now: DateTime<Utc>) -> Result<bool> {
+    let path = hook_cooldowns_path();
+    recent_cooldown_key_seen_from_path(&path, key, max_age_seconds, now)
+}
+
+fn recent_cooldown_key_seen_from_path(
+    path: &Path,
+    key: &str,
+    max_age_seconds: i64,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    for line in read_tail_lines(path, HOOK_EVENTS_TAIL_SCAN_BYTES)?
+        .into_iter()
+        .rev()
+    {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<HookCooldownLine>(trimmed) else {
+            continue;
+        };
+        let age = now.signed_duration_since(event.ts).num_seconds();
+        if age > max_age_seconds {
+            break;
+        }
+        if event.event_key == key {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn recent_event_with_key_from_events(
@@ -1040,6 +1190,26 @@ fn installed_app_command_present(commands: &[String]) -> bool {
     commands
         .iter()
         .any(|command| command.contains(INSTALLED_APP_EXECUTABLE))
+}
+
+fn read_tail_lines(path: &Path, max_bytes: u64) -> Result<Vec<String>> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))?;
+
+    let mut bytes = Vec::with_capacity((len - start).min(max_bytes) as usize);
+    file.read_to_end(&mut bytes)?;
+    if start > 0 {
+        let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+            return Ok(Vec::new());
+        };
+        bytes.drain(..=newline);
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(text.lines().map(str::to_string).collect())
 }
 
 fn print_json(value: &Value) -> Result<()> {
@@ -1173,7 +1343,10 @@ mod tests {
             latest_feedback: Some(test_feedback_snapshot("thread-a")),
         };
 
-        assert!(should_notify_completion(&notification));
+        assert!(should_notify_completion(
+            &AppConfig::default(),
+            &notification
+        ));
         let text = format_completion_notification(&notification);
         assert!(text.contains("线程正常完成"));
         assert!(text.contains("测试线程"));
@@ -1204,7 +1377,51 @@ mod tests {
             latest_feedback: None,
         };
 
-        assert!(!should_notify_completion(&notification));
+        assert!(!should_notify_completion(
+            &AppConfig::default(),
+            &notification
+        ));
+    }
+
+    #[test]
+    fn completion_notification_can_be_disabled_by_config() {
+        let mut cfg = AppConfig::default();
+        cfg.observability.completion_notifications_enabled = false;
+        let notification = CompletionNotification {
+            event: Some("Stop".to_string()),
+            session_id: Some("thread-a".to_string()),
+            turn_id: Some("turn-a".to_string()),
+            cwd: Some("/Users/gosu/Documents".to_string()),
+            model: Some("gpt".to_string()),
+            source: "last_assistant_message".to_string(),
+            body: "任务已经完成，验证通过。".to_string(),
+            latest_feedback: Some(test_feedback_snapshot("thread-a")),
+        };
+
+        assert!(!should_notify_completion(&cfg, &notification));
+    }
+
+    #[test]
+    fn latest_feedback_collection_can_be_disabled_for_stop_classification() {
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: Some("thread".to_string()),
+            transcript_path: None,
+            cwd: None,
+            model: None,
+            turn_id: Some("turn".to_string()),
+            stop_hook_active: Some(false),
+            last_assistant_message: Some("任务已经完成，验证通过。".to_string()),
+        };
+
+        let classification = classify_stop_input_with_feedback(&input, false);
+
+        assert_eq!(classification.decision.kind, RecoveryKind::None);
+        assert!(classification.latest_feedback.is_none());
+        assert_eq!(
+            stop_hook_action(&input, &AppConfig::default(), &classification, false),
+            "none"
+        );
     }
 
     #[test]
@@ -1384,6 +1601,22 @@ mod tests {
     }
 
     #[test]
+    fn normal_completion_event_logging_is_configurable() {
+        let mut cfg = AppConfig::default();
+        let classification = StopClassification {
+            decision: RecoveryDecision::none(),
+            source: "last_assistant_message".to_string(),
+            body: "任务完成".to_string(),
+            latest_feedback: Some(test_feedback_snapshot("thread")),
+        };
+
+        assert!(!should_log_stop_event(&cfg, &classification, "completed"));
+        cfg.observability.record_normal_completion_events = true;
+        assert!(should_log_stop_event(&cfg, &classification, "completed"));
+        assert!(should_write_cooldown_key(&classification, "completed"));
+    }
+
+    #[test]
     fn long_delay_is_deferred_outside_stop_hook() {
         let cfg = AppConfig::default();
         let input = HookInput {
@@ -1498,6 +1731,38 @@ mod tests {
         assert!(stale.is_none());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recent_cooldown_key_respects_age() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-sentinel-hook-cooldowns-{}.jsonl",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let key = "thread:turn:None:hash";
+        let now = Utc::now();
+        let recent = json!({
+            "ts": now - chrono::Duration::seconds(30),
+            "event_key": key
+        });
+        let old = json!({
+            "ts": now - chrono::Duration::seconds(400),
+            "event_key": "old-key"
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&old).unwrap(),
+                serde_json::to_string(&recent).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(recent_cooldown_key_seen_from_path(&path, key, 300, now).unwrap());
+        assert!(!recent_cooldown_key_seen_from_path(&path, "old-key", 300, now).unwrap());
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

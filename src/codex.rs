@@ -13,7 +13,7 @@ use sysinfo::System;
 
 use crate::app_server_probe::ThreadProbe;
 use crate::recovery::{RecoveryDecision, RecoveryKind, classify_error};
-use crate::{app_server_probe, config, desktop_control};
+use crate::{app_server_probe, config, desktop_control, maintenance};
 
 const THREAD_RECOVERY_LOOKBACK_SECONDS: i64 = 600;
 const THREAD_RECOVERY_MAX_LOOKBACK_SECONDS: i64 = 2 * 60 * 60;
@@ -288,6 +288,14 @@ pub fn clear_archived_threads() -> Result<ClearArchivedResult> {
         tx.execute("DELETE FROM threads WHERE id = ?1", [thread_id])?;
     }
     tx.commit()?;
+
+    if let Ok(cfg) = config::load_or_create() {
+        if let Err(err) = maintenance::prune_cleared_rollout_backups(
+            cfg.observability.cleared_rollout_backup_max_bytes,
+        ) {
+            tracing::debug!("failed to prune cleared archived rollout backups: {err:#}");
+        }
+    }
 
     Ok(ClearArchivedResult {
         cleared_threads: archived.len(),

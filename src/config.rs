@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub telegram: TelegramConfig,
     pub watch: WatchConfig,
     pub recovery: RecoveryConfig,
+    pub observability: ObservabilityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,12 +45,26 @@ pub struct RecoveryConfig {
     pub safety_rephrase_prompt: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObservabilityConfig {
+    pub latest_feedback_enabled: bool,
+    pub completion_notifications_enabled: bool,
+    pub record_normal_completion_events: bool,
+    pub hook_event_max_lines: usize,
+    pub hook_cooldown_max_lines: usize,
+    pub control_queue_max_lines: usize,
+    pub log_max_bytes: u64,
+    pub cleared_rollout_backup_max_bytes: u64,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             telegram: TelegramConfig::default(),
             watch: WatchConfig::default(),
             recovery: RecoveryConfig::default(),
+            observability: ObservabilityConfig::default(),
         }
     }
 }
@@ -85,6 +100,21 @@ impl Default for RecoveryConfig {
             continue_prompt: "继续干。请先检查当前线程最近状态和工具输出，不要从头开始；如果上一步因为网络、限流或服务端临时错误中断，接着执行；如果其实已经完成，直接汇报结果。".to_string(),
             tool_failure_prompt: "继续干。上一条工具调用失败了，请不要重复使用失效的 session/process/tool；先检查可用工具和当前状态，换一种方式继续完成任务。".to_string(),
             safety_rephrase_prompt: default_safety_rephrase_prompt(),
+        }
+    }
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            latest_feedback_enabled: true,
+            completion_notifications_enabled: true,
+            record_normal_completion_events: false,
+            hook_event_max_lines: 500,
+            hook_cooldown_max_lines: 1000,
+            control_queue_max_lines: 1000,
+            log_max_bytes: 5 * 1024 * 1024,
+            cleared_rollout_backup_max_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -157,5 +187,11 @@ enabled = false
         assert!(cfg.telegram.pairing_enabled);
         assert!(cfg.recovery.auto_recover);
         assert!(!cfg.recovery.safety_rephrase_prompt.is_empty());
+        assert!(cfg.observability.latest_feedback_enabled);
+        assert!(cfg.observability.completion_notifications_enabled);
+        assert!(!cfg.observability.record_normal_completion_events);
+        assert_eq!(cfg.observability.hook_event_max_lines, 500);
+        assert_eq!(cfg.observability.control_queue_max_lines, 1000);
+        assert_eq!(cfg.observability.log_max_bytes, 5 * 1024 * 1024);
     }
 }
