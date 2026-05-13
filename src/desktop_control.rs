@@ -31,6 +31,10 @@ const POST_SEND_SETTLE: Duration = Duration::from_millis(520);
 const PASTEBOARD_SETTLE: Duration = Duration::from_millis(120);
 #[cfg(target_os = "macos")]
 const COMPOSER_CLEAR_PASS_SETTLE: Duration = Duration::from_millis(90);
+#[cfg(target_os = "macos")]
+const EXISTING_THREAD_RIGHT_PANEL_WIDTH: f64 = 420.0;
+#[cfg(target_os = "macos")]
+const EXISTING_THREAD_COMPOSER_MAX_WIDTH: f64 = 980.0;
 
 #[cfg(target_os = "macos")]
 use core_foundation::base::{CFType, TCFType};
@@ -236,14 +240,20 @@ fn submit_prompt_to_current_codex_window(
     placement: ComposerPlacement,
 ) -> Result<()> {
     let window = wait_for_codex_window(Duration::from_secs(4))?;
-    for point in prompt_focus_points(&window, attempt, placement) {
+    dismiss_input_overlays(window.pid)?;
+    let focus_points = prompt_focus_points(&window, attempt, placement);
+    for point in &focus_points {
         click_at(window.pid, point.x, point.y)?;
         std::thread::sleep(Duration::from_millis(90));
     }
     std::thread::sleep(COMPOSER_AFTER_FOCUS_SETTLE);
 
-    clear_current_input(window.pid)?;
+    clear_current_input(window.pid, attempt)?;
     std::thread::sleep(COMPOSER_AFTER_CLEAR_SETTLE);
+    if let Some(point) = focus_points.first() {
+        click_at(window.pid, point.x, point.y)?;
+        std::thread::sleep(COMPOSER_AFTER_FOCUS_SETTLE);
+    }
     insert_prompt_text(window.pid, prompt, attempt)?;
     std::thread::sleep(COMPOSER_AFTER_INSERT_SETTLE);
     trigger_send(&window, attempt, placement)?;
@@ -842,21 +852,22 @@ fn prompt_focus_points(
 
 #[cfg(target_os = "macos")]
 fn existing_thread_prompt_focus_points(window: &CodexWindow, attempt: usize) -> Vec<CGPoint> {
-    let x_center = clamp_window_x(window, window.x + (window.width * 0.50));
-    let x_left = clamp_window_x(window, window.x + (window.width * 0.42));
-    let x_right = clamp_window_x(window, window.x + (window.width * 0.58));
-    let y_upper = clamp_window_y(window, window.y + window.height - 146.0);
-    let y_middle = clamp_window_y(window, window.y + window.height - 118.0);
-    let y_lower = clamp_window_y(window, window.y + window.height - 96.0);
+    let bounds = existing_thread_composer_bounds(window, true);
+    let x_center = bounds.center_x();
+    let x_left = clamp_window_x(window, bounds.left + 88.0);
+    let x_right = clamp_window_x(window, bounds.right - 180.0);
+    let y_upper = clamp_window_y(window, window.y + window.height - 106.0);
+    let y_middle = clamp_window_y(window, window.y + window.height - 88.0);
+    let y_lower = clamp_window_y(window, window.y + window.height - 70.0);
 
     let points = match attempt % 4 {
         0 => vec![
-            CGPoint::new(x_center, y_middle),
             CGPoint::new(x_left, y_middle),
+            CGPoint::new(x_center, y_middle),
         ],
         1 => vec![
-            CGPoint::new(x_center, y_upper),
             CGPoint::new(x_right, y_upper),
+            CGPoint::new(x_center, y_middle),
         ],
         2 => vec![
             CGPoint::new(x_center, y_lower),
@@ -868,6 +879,44 @@ fn existing_thread_prompt_focus_points(window: &CodexWindow, attempt: usize) -> 
         ],
     };
     points
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct ExistingThreadComposerBounds {
+    left: f64,
+    right: f64,
+}
+
+#[cfg(target_os = "macos")]
+impl ExistingThreadComposerBounds {
+    fn center_x(&self) -> f64 {
+        self.left + ((self.right - self.left) / 2.0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn existing_thread_composer_bounds(
+    window: &CodexWindow,
+    reserve_right_panel: bool,
+) -> ExistingThreadComposerBounds {
+    let reserve_width = if reserve_right_panel && window.width >= 1_300.0 {
+        EXISTING_THREAD_RIGHT_PANEL_WIDTH.min(window.width * 0.30)
+    } else {
+        0.0
+    };
+    let main_left = window.x;
+    let main_right = window.x + window.width - reserve_width;
+    let main_width = (main_right - main_left).max(360.0);
+    let composer_width = main_width
+        .min(EXISTING_THREAD_COMPOSER_MAX_WIDTH)
+        .max(360.0);
+    let left = main_left + ((main_width - composer_width) / 2.0);
+    let right = left + composer_width;
+    ExistingThreadComposerBounds {
+        left: clamp_window_x(window, left),
+        right: clamp_window_x(window, right),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -912,18 +961,54 @@ fn send_button_point(
 }
 
 #[cfg(target_os = "macos")]
-fn existing_thread_send_button_point(window: &CodexWindow, attempt: usize) -> CGPoint {
-    let x = match attempt % 3 {
-        1 => window.x + window.width - 72.0,
-        2 => window.x + window.width - 46.0,
-        _ => window.x + window.width - 58.0,
-    };
+fn send_button_points(
+    window: &CodexWindow,
+    attempt: usize,
+    placement: ComposerPlacement,
+) -> Vec<CGPoint> {
+    match placement {
+        ComposerPlacement::ExistingThread => existing_thread_send_button_points(window, attempt),
+        ComposerPlacement::NewThread => vec![new_thread_send_button_point(window, attempt)],
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn existing_thread_send_button_points(window: &CodexWindow, attempt: usize) -> Vec<CGPoint> {
     let y = match attempt % 3 {
-        1 => window.y + window.height - 96.0,
-        2 => window.y + window.height - 72.0,
+        1 => window.y + window.height - 94.0,
+        2 => window.y + window.height - 74.0,
         _ => window.y + window.height - 84.0,
     };
-    CGPoint::new(clamp_window_x(window, x), clamp_window_y(window, y))
+    let y = clamp_window_y(window, y);
+    let mut points = Vec::new();
+    for reserve_right_panel in [true, false] {
+        let bounds = existing_thread_composer_bounds(window, reserve_right_panel);
+        let x = match attempt % 3 {
+            1 => bounds.right - 42.0,
+            2 => bounds.right - 24.0,
+            _ => bounds.right - 32.0,
+        };
+        let point = CGPoint::new(clamp_window_x(window, x), y);
+        if points.iter().all(|existing: &CGPoint| {
+            (existing.x - point.x).abs() > 12.0 || (existing.y - point.y).abs() > 12.0
+        }) {
+            points.push(point);
+        }
+    }
+    points
+}
+
+#[cfg(target_os = "macos")]
+fn existing_thread_send_button_point(window: &CodexWindow, attempt: usize) -> CGPoint {
+    existing_thread_send_button_points(window, attempt)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            CGPoint::new(
+                clamp_window_x(window, window.x + window.width - 58.0),
+                clamp_window_y(window, window.y + window.height - 84.0),
+            )
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -953,8 +1038,10 @@ fn trigger_send(window: &CodexWindow, attempt: usize, placement: ComposerPlaceme
                 )?;
             }
             ExistingThreadSendMethod::SendButton => {
-                let point = send_button_point(window, attempt, placement);
-                click_at(window.pid, point.x, point.y)?;
+                for point in send_button_points(window, attempt, placement) {
+                    click_at(window.pid, point.x, point.y)?;
+                    std::thread::sleep(Duration::from_millis(120));
+                }
             }
             ExistingThreadSendMethod::Return => {
                 post_key_press(window.pid, KeyCode::RETURN, CGEventFlags::empty())?;
@@ -995,8 +1082,8 @@ enum ExistingThreadSendMethod {
 #[cfg(target_os = "macos")]
 fn existing_thread_send_method(attempt: usize) -> ExistingThreadSendMethod {
     match attempt % 4 {
-        0 => ExistingThreadSendMethod::CommandReturn,
-        1 | 2 => ExistingThreadSendMethod::SendButton,
+        0 | 2 => ExistingThreadSendMethod::SendButton,
+        1 => ExistingThreadSendMethod::CommandReturn,
         _ => ExistingThreadSendMethod::Return,
     }
 }
@@ -1077,26 +1164,52 @@ fn post_command_n(pid: i32) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn clear_current_input(pid: i32) -> Result<()> {
-    for _ in 0..2 {
-        post_key_press(pid, KeyCode::ESCAPE, CGEventFlags::empty())?;
+fn clear_current_input(pid: i32, attempt: usize) -> Result<()> {
+    for _ in 0..clear_passes(attempt) {
+        clear_focused_text_line(pid)?;
         std::thread::sleep(COMPOSER_CLEAR_PASS_SETTLE);
-
-        select_all_current_input(pid)?;
-        post_key_press(pid, KeyCode::DELETE, CGEventFlags::empty())?;
-        post_key_press(pid, KeyCode::FORWARD_DELETE, CGEventFlags::empty())?;
+        for keycode in safe_clear_keycodes(attempt) {
+            post_key_press(pid, keycode, CGEventFlags::empty())?;
+        }
         std::thread::sleep(COMPOSER_CLEAR_PASS_SETTLE);
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn select_all_current_input(pid: i32) -> Result<()> {
-    let flags = CGEventFlags::CGEventFlagCommand;
-    post_key(pid, KeyCode::COMMAND, true, flags)?;
-    post_key(pid, KeyCode::ANSI_A, true, flags)?;
-    post_key(pid, KeyCode::ANSI_A, false, flags)?;
-    post_key(pid, KeyCode::COMMAND, false, CGEventFlags::empty())
+fn clear_passes(attempt: usize) -> usize {
+    if attempt == 0 { 2 } else { 3 }
+}
+
+#[cfg(target_os = "macos")]
+fn safe_clear_keycodes(attempt: usize) -> Vec<u16> {
+    let mut keycodes = vec![KeyCode::DELETE, KeyCode::FORWARD_DELETE];
+    if attempt > 0 {
+        keycodes.extend([KeyCode::DELETE, KeyCode::DELETE, KeyCode::FORWARD_DELETE]);
+    }
+    keycodes
+}
+
+#[cfg(target_os = "macos")]
+fn dismiss_input_overlays(pid: i32) -> Result<()> {
+    post_key_press(pid, KeyCode::ESCAPE, CGEventFlags::empty())?;
+    std::thread::sleep(COMPOSER_CLEAR_PASS_SETTLE);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_focused_text_line(pid: i32) -> Result<()> {
+    post_control_key_press(pid, KeyCode::ANSI_A)?;
+    post_control_key_press(pid, KeyCode::ANSI_K)
+}
+
+#[cfg(target_os = "macos")]
+fn post_control_key_press(pid: i32, keycode: u16) -> Result<()> {
+    let flags = CGEventFlags::CGEventFlagControl;
+    post_key(pid, KeyCode::CONTROL, true, flags)?;
+    post_key(pid, keycode, true, flags)?;
+    post_key(pid, keycode, false, flags)?;
+    post_key(pid, KeyCode::CONTROL, false, CGEventFlags::empty())
 }
 
 #[cfg(target_os = "macos")]
@@ -1243,14 +1356,14 @@ mod tests {
     }
 
     #[test]
-    fn existing_thread_submit_prefers_command_return_before_click_fallbacks() {
+    fn existing_thread_submit_prefers_send_button_before_shortcut_fallbacks() {
         assert_eq!(
             existing_thread_send_method(0),
-            ExistingThreadSendMethod::CommandReturn
+            ExistingThreadSendMethod::SendButton
         );
         assert_eq!(
             existing_thread_send_method(1),
-            ExistingThreadSendMethod::SendButton
+            ExistingThreadSendMethod::CommandReturn
         );
         assert_eq!(
             existing_thread_send_method(2),
@@ -1260,6 +1373,47 @@ mod tests {
             existing_thread_send_method(3),
             ExistingThreadSendMethod::Return
         );
+    }
+
+    #[test]
+    fn clear_current_input_avoids_global_select_all() {
+        assert_eq!(clear_passes(0), 2);
+        assert_eq!(clear_passes(1), 3);
+
+        for attempt in 0..4 {
+            let keycodes = safe_clear_keycodes(attempt);
+            assert!(keycodes.contains(&KeyCode::DELETE));
+            assert!(keycodes.contains(&KeyCode::FORWARD_DELETE));
+            assert!(!keycodes.contains(&KeyCode::ANSI_A));
+        }
+    }
+
+    #[test]
+    fn clear_line_shortcut_uses_control_not_command() {
+        assert_ne!(
+            CGEventFlags::CGEventFlagControl,
+            CGEventFlags::CGEventFlagCommand
+        );
+        assert_eq!(KeyCode::ANSI_A, 0);
+        assert_eq!(KeyCode::ANSI_K, 40);
+    }
+
+    #[test]
+    fn existing_thread_send_points_cover_side_panel_and_full_width_layouts() {
+        let window = CodexWindow {
+            pid: 123,
+            window_id: 456,
+            x: 0.0,
+            y: 0.0,
+            width: 1792.0,
+            height: 1280.0,
+        };
+        let points = existing_thread_send_button_points(&window, 0);
+
+        assert_eq!(points.len(), 2);
+        assert!((points[0].x - 1144.0).abs() <= 2.0);
+        assert!((points[1].x - 1354.0).abs() <= 2.0);
+        assert!(points.iter().all(|point| (point.y - 1196.0).abs() <= 2.0));
     }
 
     #[test]
