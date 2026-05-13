@@ -29,6 +29,8 @@ const COMPOSER_AFTER_INSERT_SETTLE: Duration = Duration::from_millis(260);
 const POST_SEND_SETTLE: Duration = Duration::from_millis(520);
 #[cfg(target_os = "macos")]
 const PASTEBOARD_SETTLE: Duration = Duration::from_millis(120);
+#[cfg(target_os = "macos")]
+const COMPOSER_CLEAR_PASS_SETTLE: Duration = Duration::from_millis(90);
 
 #[cfg(target_os = "macos")]
 use core_foundation::base::{CFType, TCFType};
@@ -1076,13 +1078,25 @@ fn post_command_n(pid: i32) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn clear_current_input(pid: i32) -> Result<()> {
+    for _ in 0..2 {
+        post_key_press(pid, KeyCode::ESCAPE, CGEventFlags::empty())?;
+        std::thread::sleep(COMPOSER_CLEAR_PASS_SETTLE);
+
+        select_all_current_input(pid)?;
+        post_key_press(pid, KeyCode::DELETE, CGEventFlags::empty())?;
+        post_key_press(pid, KeyCode::FORWARD_DELETE, CGEventFlags::empty())?;
+        std::thread::sleep(COMPOSER_CLEAR_PASS_SETTLE);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn select_all_current_input(pid: i32) -> Result<()> {
     let flags = CGEventFlags::CGEventFlagCommand;
     post_key(pid, KeyCode::COMMAND, true, flags)?;
     post_key(pid, KeyCode::ANSI_A, true, flags)?;
     post_key(pid, KeyCode::ANSI_A, false, flags)?;
-    post_key(pid, KeyCode::COMMAND, false, CGEventFlags::empty())?;
-    post_key(pid, KeyCode::DELETE, true, CGEventFlags::empty())?;
-    post_key(pid, KeyCode::DELETE, false, CGEventFlags::empty())
+    post_key(pid, KeyCode::COMMAND, false, CGEventFlags::empty())
 }
 
 #[cfg(target_os = "macos")]
@@ -1108,8 +1122,8 @@ enum TextInputMethod {
 #[cfg(target_os = "macos")]
 fn text_input_method(attempt: usize) -> TextInputMethod {
     match attempt % 4 {
-        0 | 1 => TextInputMethod::Unicode,
-        2 => TextInputMethod::ClipboardPaste,
+        0 | 2 => TextInputMethod::ClipboardPaste,
+        1 => TextInputMethod::Unicode,
         _ => TextInputMethod::Unicode,
     }
 }
@@ -1221,8 +1235,8 @@ mod tests {
     }
 
     #[test]
-    fn visible_submit_prefers_unicode_before_clipboard_fallback() {
-        assert_eq!(text_input_method(0), TextInputMethod::Unicode);
+    fn visible_submit_prefers_clipboard_before_unicode_fallback() {
+        assert_eq!(text_input_method(0), TextInputMethod::ClipboardPaste);
         assert_eq!(text_input_method(1), TextInputMethod::Unicode);
         assert_eq!(text_input_method(2), TextInputMethod::ClipboardPaste);
         assert_eq!(text_input_method(3), TextInputMethod::Unicode);
