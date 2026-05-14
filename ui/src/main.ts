@@ -81,7 +81,6 @@ interface ConfigSummary {
   hook_cooldown_max_lines: number;
   control_queue_max_lines: number;
   log_max_bytes: number;
-  cleared_rollout_backup_max_bytes: number;
 }
 
 interface HookStatus {
@@ -181,7 +180,6 @@ interface RuntimeDraft {
   hook_cooldown_max_lines: number;
   control_queue_max_lines: number;
   log_max_bytes: number;
-  cleared_rollout_backup_max_bytes: number;
 }
 
 interface TelegramPairResult {
@@ -986,10 +984,6 @@ function renderRuntimeSettings(draft: RuntimeDraft, configPath: string) {
         <input id="runtime-log-mb" type="number" min="1" step="1" value="${bytesToMb(draft.log_max_bytes)}" />
       </label>
       <label>
-        <span>清归档备份上限 MB</span>
-        <input id="runtime-rollout-backup-mb" type="number" min="100" step="100" value="${bytesToMb(draft.cleared_rollout_backup_max_bytes)}" />
-      </label>
-      <label>
         <span>默认续跑指令</span>
         <textarea id="runtime-continue-prompt" rows="4">${escapeHtml(draft.continue_prompt)}</textarea>
       </label>
@@ -1391,9 +1385,6 @@ function collectRuntimeInput(): RuntimeDraft {
     hook_cooldown_max_lines: numericInput('#runtime-cooldown-lines', fallback.hook_cooldown_max_lines),
     control_queue_max_lines: numericInput('#runtime-control-lines', fallback.control_queue_max_lines),
     log_max_bytes: mbToBytes(numericInput('#runtime-log-mb', bytesToMb(fallback.log_max_bytes))),
-    cleared_rollout_backup_max_bytes: mbToBytes(
-      numericInput('#runtime-rollout-backup-mb', bytesToMb(fallback.cleared_rollout_backup_max_bytes)),
-    ),
     continue_prompt:
       app.querySelector<HTMLTextAreaElement>('#runtime-continue-prompt')?.value ?? fallback.continue_prompt,
     tool_failure_prompt:
@@ -1431,7 +1422,6 @@ function draftFromConfig(config: ConfigSummary): RuntimeDraft {
     hook_cooldown_max_lines: config.hook_cooldown_max_lines,
     control_queue_max_lines: config.control_queue_max_lines,
     log_max_bytes: config.log_max_bytes,
-    cleared_rollout_backup_max_bytes: config.cleared_rollout_backup_max_bytes,
   };
 }
 
@@ -1635,7 +1625,6 @@ function mockDashboard(
       hook_cooldown_max_lines: 1000,
       control_queue_max_lines: 1000,
       log_max_bytes: 5 * 1024 * 1024,
-      cleared_rollout_backup_max_bytes: 1024 * 1024 * 1024,
     },
     hooks: {
       feature_enabled: hooksReady,

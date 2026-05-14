@@ -69,36 +69,6 @@ pub fn trim_runtime_files(cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn prune_cleared_rollout_backups(max_bytes: u64) -> Result<()> {
-    if max_bytes == 0 {
-        return Ok(());
-    }
-
-    let root = cleared_rollout_backup_dir();
-    if !root.exists() {
-        return Ok(());
-    }
-
-    let mut entries = Vec::new();
-    collect_files(&root, &mut entries)?;
-    let mut total = entries.iter().map(|entry| entry.size).sum::<u64>();
-    if total <= max_bytes {
-        return Ok(());
-    }
-
-    entries.sort_by_key(|entry| entry.modified);
-    for entry in entries {
-        if total <= max_bytes {
-            break;
-        }
-        if fs::remove_file(&entry.path).is_ok() {
-            total = total.saturating_sub(entry.size);
-        }
-    }
-    remove_empty_dirs(&root)?;
-    Ok(())
-}
-
 pub fn managed_log_paths() -> Vec<PathBuf> {
     let dir = config::config_dir();
     [
@@ -114,50 +84,6 @@ pub fn managed_log_paths() -> Vec<PathBuf> {
     .into_iter()
     .map(|name| dir.join(name))
     .collect()
-}
-
-fn cleared_rollout_backup_dir() -> PathBuf {
-    config::config_dir().join("cleared-archived-rollouts")
-}
-
-#[derive(Debug)]
-struct FileEntry {
-    path: PathBuf,
-    size: u64,
-    modified: std::time::SystemTime,
-}
-
-fn collect_files(dir: &Path, entries: &mut Vec<FileEntry>) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            collect_files(&path, entries)?;
-        } else if metadata.is_file() {
-            entries.push(FileEntry {
-                path,
-                size: metadata.len(),
-                modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn remove_empty_dirs(root: &Path) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.metadata()?.is_dir() {
-            remove_empty_dirs(&path)?;
-            let _ = fs::remove_dir(&path);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

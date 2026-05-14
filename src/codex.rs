@@ -13,7 +13,7 @@ use sysinfo::System;
 
 use crate::app_server_probe::ThreadProbe;
 use crate::recovery::{RecoveryDecision, RecoveryKind, classify_error};
-use crate::{app_server_probe, config, desktop_control, maintenance};
+use crate::{app_server_probe, desktop_control};
 
 const THREAD_RECOVERY_LOOKBACK_SECONDS: i64 = 600;
 const THREAD_RECOVERY_MAX_LOOKBACK_SECONDS: i64 = 2 * 60 * 60;
@@ -285,15 +285,11 @@ pub fn clear_archived_threads() -> Result<ClearArchivedResult> {
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let cleanup_dir = config::config_dir()
-        .join("cleared-archived-rollouts")
-        .join(Utc::now().format("%Y%m%d-%H%M%S").to_string());
-    fs::create_dir_all(&cleanup_dir)
-        .with_context(|| format!("failed to create {}", cleanup_dir.display()))?;
+    let trash_dir = user_trash_dir()?;
 
     let mut moved_rollouts = 0;
     for (_, rollout_path) in &archived {
-        if move_file_if_exists(Path::new(rollout_path), &cleanup_dir).is_ok() {
+        if move_file_to_dir_if_exists(Path::new(rollout_path), &trash_dir).is_ok() {
             moved_rollouts += 1;
         }
     }
@@ -304,18 +300,10 @@ pub fn clear_archived_threads() -> Result<ClearArchivedResult> {
     }
     tx.commit()?;
 
-    if let Ok(cfg) = config::load_or_create() {
-        if let Err(err) = maintenance::prune_cleared_rollout_backups(
-            cfg.observability.cleared_rollout_backup_max_bytes,
-        ) {
-            tracing::debug!("failed to prune cleared archived rollout backups: {err:#}");
-        }
-    }
-
     Ok(ClearArchivedResult {
         cleared_threads: archived.len(),
         moved_rollouts,
-        cleanup_dir: cleanup_dir.display().to_string(),
+        cleanup_dir: trash_dir.display().to_string(),
     })
 }
 
@@ -1198,7 +1186,16 @@ fn archive_rollout_file(path: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
-fn move_file_if_exists(source: &Path, dest_dir: &Path) -> Result<()> {
+fn user_trash_dir() -> Result<PathBuf> {
+    let trash_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow!("failed to resolve user home directory"))?
+        .join(".Trash");
+    fs::create_dir_all(&trash_dir)
+        .with_context(|| format!("failed to create {}", trash_dir.display()))?;
+    Ok(trash_dir)
+}
+
+fn move_file_to_dir_if_exists(source: &Path, dest_dir: &Path) -> Result<()> {
     if !source.exists() {
         return Err(anyhow!("{} does not exist", source.display()));
     }
@@ -1523,6 +1520,89 @@ mod tests {
             updated_at: 1778303650,
             rollout_path: "/tmp/thread.jsonl".to_string(),
         }
+    }
+
+    struct HomeEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeEnvGuard {
+        fn set(home: &Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var("HOME", previous);
+                } else {
+                    std::env::remove_var("HOME");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clear_archived_threads_moves_rollouts_to_user_trash() {
+        let root = temp_db_path("clear-archived-trash-root");
+        let _ = fs::remove_file(&root);
+        fs::create_dir_all(&root).unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::create_dir_all(home.join(".Trash")).unwrap();
+        let _home = HomeEnvGuard::set(&home);
+
+        let rollout = root.join("rollout.jsonl");
+        fs::write(&rollout, "{}\n").unwrap();
+        let db = home.join(".codex").join("state_5.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                archived INTEGER,
+                archived_at INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, archived, archived_at)
+             VALUES ('thread-a', ?1, 1, 1778303600)",
+            [&rollout.display().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = clear_archived_threads().unwrap();
+
+        assert_eq!(result.cleared_threads, 1);
+        assert_eq!(result.moved_rollouts, 1);
+        assert_eq!(
+            result.cleanup_dir,
+            home.join(".Trash").display().to_string()
+        );
+        assert!(!rollout.exists());
+        assert!(home.join(".Trash").join("rollout.jsonl").exists());
+        assert!(
+            !home
+                .join(".codex-sentinel")
+                .join("cleared-archived-rollouts")
+                .exists()
+        );
+
+        let conn = Connection::open(&db).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM threads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

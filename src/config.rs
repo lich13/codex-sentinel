@@ -55,7 +55,6 @@ pub struct ObservabilityConfig {
     pub hook_cooldown_max_lines: usize,
     pub control_queue_max_lines: usize,
     pub log_max_bytes: u64,
-    pub cleared_rollout_backup_max_bytes: u64,
 }
 
 impl Default for AppConfig {
@@ -114,7 +113,6 @@ impl Default for ObservabilityConfig {
             hook_cooldown_max_lines: 1000,
             control_queue_max_lines: 1000,
             log_max_bytes: 5 * 1024 * 1024,
-            cleared_rollout_backup_max_bytes: 1024 * 1024 * 1024,
         }
     }
 }

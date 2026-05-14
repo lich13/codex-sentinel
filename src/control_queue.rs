@@ -230,7 +230,10 @@ fn execute_action(action: &ControlAction) -> Result<ControlResponse> {
                 request_id: String::new(),
                 completed_at: now_ts(),
                 ok: true,
-                message: format!("已清除 {} 条归档线程。", result.cleared_threads),
+                message: format!(
+                    "已清除 {} 条归档线程，{} 个 rollout 已移到废纸篓。",
+                    result.cleared_threads, result.moved_rollouts
+                ),
                 thread_id: None,
                 turn_id: None,
                 data: Some(serde_json::to_value(result)?),

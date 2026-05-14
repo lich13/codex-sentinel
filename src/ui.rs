@@ -57,7 +57,6 @@ struct ConfigSummary {
     hook_cooldown_max_lines: usize,
     control_queue_max_lines: usize,
     log_max_bytes: u64,
-    cleared_rollout_backup_max_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,7 +82,6 @@ struct RuntimeSettingsInput {
     hook_cooldown_max_lines: usize,
     control_queue_max_lines: usize,
     log_max_bytes: u64,
-    cleared_rollout_backup_max_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,9 +434,6 @@ fn save_runtime_settings(
     if input.log_max_bytes < 1024 * 1024 {
         return Err("后台日志上限不能小于 1MB".to_string());
     }
-    if input.cleared_rollout_backup_max_bytes < 100 * 1024 * 1024 {
-        return Err("清归档备份上限不能小于 100MB".to_string());
-    }
     let mut cfg = config::load_or_create().map_err(format_error)?;
     cfg.watch.enabled = input.watch_enabled;
     cfg.watch.poll_interval_seconds = input.poll_interval_seconds;
@@ -455,17 +450,9 @@ fn save_runtime_settings(
     cfg.observability.hook_cooldown_max_lines = input.hook_cooldown_max_lines;
     cfg.observability.control_queue_max_lines = input.control_queue_max_lines;
     cfg.observability.log_max_bytes = input.log_max_bytes;
-    cfg.observability.cleared_rollout_backup_max_bytes = input.cleared_rollout_backup_max_bytes;
     config::save(&cfg).map_err(format_error)?;
     if let Err(err) = maintenance::trim_runtime_files(&cfg) {
         tracing::debug!("failed to trim runtime files after settings save: {err:#}");
-    }
-    if let Err(err) = maintenance::prune_cleared_rollout_backups(
-        cfg.observability.cleared_rollout_backup_max_bytes,
-    ) {
-        tracing::debug!(
-            "failed to prune cleared archived rollout backups after settings save: {err:#}"
-        );
     }
     load_dashboard().map_err(format_error)
 }
@@ -762,7 +749,6 @@ fn summarize_config(cfg: &config::AppConfig) -> ConfigSummary {
         hook_cooldown_max_lines: cfg.observability.hook_cooldown_max_lines,
         control_queue_max_lines: cfg.observability.control_queue_max_lines,
         log_max_bytes: cfg.observability.log_max_bytes,
-        cleared_rollout_backup_max_bytes: cfg.observability.cleared_rollout_backup_max_bytes,
     }
 }
 

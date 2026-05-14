@@ -180,11 +180,6 @@ fn trim_runtime_files_once() {
     if let Err(err) = maintenance::trim_runtime_files(&cfg) {
         tracing::debug!("failed to trim runtime files: {err:#}");
     }
-    if let Err(err) = maintenance::prune_cleared_rollout_backups(
-        cfg.observability.cleared_rollout_backup_max_bytes,
-    ) {
-        tracing::debug!("failed to prune cleared archived rollout backups: {err:#}");
-    }
 }
 
 fn stop_followed_processes(snapshot: &ProcessSnapshot) -> Result<()> {
