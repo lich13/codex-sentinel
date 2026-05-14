@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, FixedOffset, Utc};
 use reqwest::Client;
 use reqwest::Url;
 use serde::Deserialize;
@@ -868,17 +869,37 @@ fn thread_detail_reply(thread_id: &str) -> Result<BotReply> {
 }
 
 fn feedback_timestamp_label(timestamp: Option<&str>) -> String {
-    timestamp
+    let Some(timestamp) = timestamp
         .map(str::trim)
         .filter(|timestamp| !timestamp.is_empty())
-        .unwrap_or("无时间戳")
-        .to_string()
+    else {
+        return "无时间戳".to_string();
+    };
+    format_beijing_rfc3339(timestamp).unwrap_or_else(|| timestamp.to_string())
+}
+
+fn format_beijing_rfc3339(timestamp: &str) -> Option<String> {
+    let parsed = DateTime::parse_from_rfc3339(timestamp).ok()?;
+    Some(
+        parsed
+            .with_timezone(&beijing_offset())
+            .format("%Y-%m-%d %H:%M:%S 北京时间")
+            .to_string(),
+    )
 }
 
 fn format_unix_timestamp(timestamp: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
-        .map(|dt| dt.to_rfc3339())
+    chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(|dt| {
+            dt.with_timezone(&beijing_offset())
+                .format("%Y-%m-%d %H:%M:%S 北京时间")
+                .to_string()
+        })
         .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn beijing_offset() -> FixedOffset {
+    FixedOffset::east_opt(8 * 60 * 60).expect("valid Beijing UTC offset")
 }
 
 fn thread_actions_keyboard(thread_id: &str) -> Value {
@@ -1403,7 +1424,7 @@ mod tests {
     fn feedback_timestamp_label_is_explicit() {
         assert_eq!(
             feedback_timestamp_label(Some("2026-05-14T01:27:03Z")),
-            "2026-05-14T01:27:03Z"
+            "2026-05-14 09:27:03 北京时间"
         );
         assert_eq!(feedback_timestamp_label(None), "无时间戳");
     }
