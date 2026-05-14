@@ -1035,11 +1035,19 @@ fn format_completion_notification(notification: &CompletionNotification) -> Stri
         .as_ref()
         .map(|feedback| feedback.text.as_str())
         .unwrap_or(notification.body.as_str());
+    let feedback_time = notification
+        .latest_feedback
+        .as_ref()
+        .and_then(|feedback| feedback.timestamp.as_deref())
+        .map(str::trim)
+        .filter(|timestamp| !timestamp.is_empty())
+        .unwrap_or("无时间戳");
 
     format!(
-        "线程正常完成\n{}\n{}\n\n最后反馈：\n{}",
+        "线程正常完成\n{}\n{}\n\n最后反馈时间：{}\n最后反馈：\n{}",
         title,
         thread_id,
+        feedback_time,
         truncate(feedback_text, 2600)
     )
 }
@@ -1238,7 +1246,7 @@ mod tests {
         HookFeedbackSnapshot {
             thread_id: thread_id.to_string(),
             title: "测试线程".to_string(),
-            timestamp: None,
+            timestamp: Some("2026-05-14T01:27:03Z".to_string()),
             text: "最终结果在这里。".to_string(),
         }
     }
@@ -1351,6 +1359,7 @@ mod tests {
         assert!(text.contains("线程正常完成"));
         assert!(text.contains("测试线程"));
         assert!(text.contains("thread-a"));
+        assert!(text.contains("最后反馈时间：2026-05-14T01:27:03Z"));
         assert!(text.contains("最终结果在这里。"));
 
         let keyboard = completion_notification_keyboard(&notification).unwrap();

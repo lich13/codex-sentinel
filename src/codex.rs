@@ -104,6 +104,15 @@ pub struct ThreadFeedback {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningThread {
+    pub thread: ThreadSummary,
+    pub thread_status: Option<String>,
+    pub turn_id: Option<String>,
+    pub turn_status: Option<String>,
+    pub started_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadMutationResult {
     pub thread_id: String,
     pub title: String,
@@ -160,6 +169,10 @@ fn codex_process_status() -> CodexProcessStatus {
         }
     }
     status
+}
+
+pub fn codex_app_running() -> bool {
+    codex_process_status().codex_running
 }
 
 pub fn read_recent_threads(limit: usize) -> Result<Vec<ThreadSummary>> {
@@ -453,6 +466,42 @@ pub fn recoverable_threads(limit: usize) -> Result<Vec<ThreadRecovery>> {
         }
     }
     Ok(candidates)
+}
+
+pub fn running_threads(limit: usize) -> Result<Vec<RunningThread>> {
+    let recent_threads = read_recent_threads(limit)?;
+    let thread_ids = recent_threads
+        .iter()
+        .map(|thread| thread.id.clone())
+        .collect::<Vec<_>>();
+    let app_server_probes =
+        app_server_probe::read_thread_probes(&thread_ids).unwrap_or_else(|err| {
+            tracing::debug!("Codex app-server probe skipped for running thread scan: {err:#}");
+            Default::default()
+        });
+
+    let mut running = Vec::new();
+    for thread in recent_threads {
+        if let Some(probe) = app_server_probes.get(&thread.id) {
+            if let Some(item) = running_thread_from_probe(thread, probe) {
+                running.push(item);
+            }
+        }
+    }
+    Ok(running)
+}
+
+fn running_thread_from_probe(thread: ThreadSummary, probe: &ThreadProbe) -> Option<RunningThread> {
+    if !probe.is_known_running() {
+        return None;
+    }
+    Some(RunningThread {
+        thread,
+        thread_status: probe.thread_status.clone(),
+        turn_id: probe.latest_turn_id.clone(),
+        turn_status: probe.latest_turn_status.clone(),
+        started_at: probe.latest_turn_started_at,
+    })
 }
 
 fn latest_recovery_event_for_thread(
@@ -1432,6 +1481,50 @@ mod tests {
             latest_turn_completed_at: None,
             source: "test".to_string(),
         }
+    }
+
+    fn thread_summary(id: &str) -> ThreadSummary {
+        ThreadSummary {
+            id: id.to_string(),
+            title: "测试线程".to_string(),
+            cwd: "/Users/gosu/Documents".to_string(),
+            updated_at: 1778303650,
+            rollout_path: "/tmp/thread.jsonl".to_string(),
+        }
+    }
+
+    #[test]
+    fn running_thread_from_probe_keeps_only_known_running_threads() {
+        let thread = thread_summary("thread-a");
+        let running_probe = ThreadProbe {
+            thread_id: "thread-a".to_string(),
+            thread_status: Some("active".to_string()),
+            latest_turn_id: Some("turn-a".to_string()),
+            latest_turn_status: Some("inProgress".to_string()),
+            latest_turn_error: None,
+            latest_turn_started_at: Some(1778303600),
+            latest_turn_completed_at: None,
+            source: "test".to_string(),
+        };
+        let running = running_thread_from_probe(thread.clone(), &running_probe)
+            .expect("active app-server probe should be displayed as running");
+
+        assert_eq!(running.thread.id, "thread-a");
+        assert_eq!(running.turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(running.turn_status.as_deref(), Some("inProgress"));
+        assert_eq!(running.started_at, Some(1778303600));
+
+        let completed_probe = ThreadProbe {
+            thread_id: "thread-a".to_string(),
+            thread_status: Some("notLoaded".to_string()),
+            latest_turn_id: Some("turn-b".to_string()),
+            latest_turn_status: Some("completed".to_string()),
+            latest_turn_error: None,
+            latest_turn_started_at: Some(1778303500),
+            latest_turn_completed_at: Some(1778303600),
+            source: "test".to_string(),
+        };
+        assert!(running_thread_from_probe(thread, &completed_probe).is_none());
     }
 
     #[test]
