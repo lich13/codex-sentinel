@@ -950,7 +950,7 @@ fn telegram_api_url(token: &str, method: &str) -> String {
 fn telegram_client() -> Result<Client> {
     Client::builder()
         .timeout(Duration::from_secs(TELEGRAM_PANEL_HTTP_TIMEOUT_SECONDS))
-        .pool_max_idle_per_host(0)
+        .pool_max_idle_per_host(1)
         .build()
         .context("failed to build Telegram HTTP client")
 }

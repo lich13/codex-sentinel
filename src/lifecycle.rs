@@ -20,6 +20,7 @@ pub struct LifecycleStatus {
     pub daemon_running: bool,
     pub control_worker_running: bool,
     pub lifecycle_running: bool,
+    pub codex_pids: Vec<u32>,
     pub gui_pids: Vec<u32>,
     pub daemon_pids: Vec<u32>,
     pub control_worker_pids: Vec<u32>,
@@ -30,6 +31,7 @@ pub struct LifecycleStatus {
 #[derive(Debug)]
 struct ProcessSnapshot {
     codex_running: bool,
+    codex_pids: Vec<u32>,
     gui_pids: Vec<u32>,
     daemon_pids: Vec<u32>,
     control_worker_pids: Vec<u32>,
@@ -71,6 +73,7 @@ pub fn status() -> Result<LifecycleStatus> {
         daemon_running: !snapshot.daemon_pids.is_empty(),
         control_worker_running: !snapshot.control_worker_pids.is_empty(),
         lifecycle_running: !snapshot.lifecycle_pids.is_empty(),
+        codex_pids: snapshot.codex_pids,
         gui_pids: snapshot.gui_pids,
         daemon_pids: snapshot.daemon_pids,
         control_worker_pids: snapshot.control_worker_pids,
@@ -225,6 +228,7 @@ fn inspect_processes() -> Result<ProcessSnapshot> {
 
     let mut snapshot = ProcessSnapshot {
         codex_running: false,
+        codex_pids: Vec::new(),
         gui_pids: Vec::new(),
         daemon_pids: Vec::new(),
         control_worker_pids: Vec::new(),
@@ -246,6 +250,7 @@ fn inspect_processes() -> Result<ProcessSnapshot> {
 
         if is_codex_app_process(&name, &cmd_text) {
             snapshot.codex_running = true;
+            snapshot.codex_pids.push(pid);
             continue;
         }
 
@@ -262,6 +267,7 @@ fn inspect_processes() -> Result<ProcessSnapshot> {
         }
     }
 
+    snapshot.codex_pids.sort_unstable();
     snapshot.gui_pids.sort_unstable();
     snapshot.daemon_pids.sort_unstable();
     snapshot.control_worker_pids.sort_unstable();

@@ -10,11 +10,10 @@ use tokio::time::sleep;
 
 use crate::config::AppConfig;
 use crate::recovery::{RecoveryDecision, RecoveryKind, sanitized_recovery_text};
-use crate::{codex, config, control_queue, desktop_control};
+use crate::{codex, config, control_queue, desktop_control, lifecycle};
 
-const TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS: u64 = 0;
-const TELEGRAM_EMPTY_POLL_SLEEP_SECONDS: u64 = 2;
-const TELEGRAM_HTTP_TIMEOUT_SECONDS: u64 = 12;
+const TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS: u64 = 15;
+const TELEGRAM_HTTP_TIMEOUT_SECONDS: u64 = 25;
 const RECOVERY_FAILURE_BACKOFF_SECONDS: u64 = 60;
 
 #[derive(Debug, Deserialize)]
@@ -118,7 +117,6 @@ pub async fn run_bot(cfg: AppConfig) -> Result<()> {
 
         let updates = resp.result.unwrap_or_default();
         if updates.is_empty() {
-            sleep(Duration::from_secs(TELEGRAM_EMPTY_POLL_SLEEP_SECONDS)).await;
             continue;
         }
 
@@ -238,7 +236,7 @@ async fn get_updates(
 fn telegram_client() -> Result<Client> {
     Client::builder()
         .timeout(Duration::from_secs(TELEGRAM_HTTP_TIMEOUT_SECONDS))
-        .pool_max_idle_per_host(0)
+        .pool_max_idle_per_host(1)
         .build()
         .context("failed to build telegram HTTP client")
 }
@@ -547,6 +545,10 @@ async fn handle_callback(
         pending.remove(&chat_id);
         return status_reply(cfg);
     }
+    if let Some(process) = data.strip_prefix("process:") {
+        pending.remove(&chat_id);
+        return process_detail_reply(process);
+    }
     if data == "threads" {
         pending.remove(&chat_id);
         return thread_list_reply();
@@ -632,6 +634,7 @@ fn main_menu_reply() -> Result<BotReply> {
 
 fn status_reply(cfg: &AppConfig) -> Result<BotReply> {
     let status = codex::collect_status()?;
+    let lifecycle_status = lifecycle::status()?;
     let recoverable = codex::recoverable_threads(5)?;
     let desktop = desktop_control::inspect();
     let active = status
@@ -641,7 +644,7 @@ fn status_reply(cfg: &AppConfig) -> Result<BotReply> {
         .unwrap_or_else(|| "未读取到最近线程".to_string());
     Ok(BotReply {
         text: format!(
-            "Codex Sentinel 状态\n\nCodex APP：{}\n可见输入：{}\n自动恢复：{}\nWatcher：{} / {}s\n待恢复线程：{}\n\n当前线程：\n{}",
+            "Codex Sentinel 状态\n\nCodex APP：{}\n可见输入：{}\n自动恢复：{}\nWatcher：{} / {}s\n\n运行进程：\n{}\n\n待恢复线程：{}\n\n当前线程：\n{}",
             if status.codex_running {
                 "运行中"
             } else {
@@ -663,11 +666,165 @@ fn status_reply(cfg: &AppConfig) -> Result<BotReply> {
                 "关闭"
             },
             cfg.watch.poll_interval_seconds,
+            process_status_text(&lifecycle_status),
             recoverable.len(),
             active,
         ),
-        keyboard: Some(main_keyboard()),
+        keyboard: Some(status_keyboard(&lifecycle_status)),
     })
+}
+
+fn process_status_text(status: &lifecycle::LifecycleStatus) -> String {
+    [
+        format_process_line("Codex APP", status.codex_running, &status.codex_pids),
+        format_process_line(
+            "Sentinel GUI",
+            status.sentinel_gui_running,
+            &status.gui_pids,
+        ),
+        format_process_line(
+            "Telegram daemon",
+            status.daemon_running,
+            &status.daemon_pids,
+        ),
+        format_process_line(
+            "Control worker",
+            status.control_worker_running,
+            &status.control_worker_pids,
+        ),
+        format_process_line(
+            "Lifecycle",
+            status.lifecycle_running,
+            &status.lifecycle_pids,
+        ),
+    ]
+    .join("\n")
+}
+
+fn format_process_line(label: &str, running: bool, pids: &[u32]) -> String {
+    let pids = pid_list(pids);
+    if pids == "-" {
+        format!("{label}：{}", process_state(running))
+    } else {
+        format!("{label}：{} / pid {pids}", process_state(running))
+    }
+}
+
+fn status_keyboard(status: &lifecycle::LifecycleStatus) -> Value {
+    json!({
+        "inline_keyboard": [
+            [
+                process_button("Codex", "codex", status.codex_running),
+                process_button("GUI", "gui", status.sentinel_gui_running)
+            ],
+            [
+                process_button("Daemon", "daemon", status.daemon_running),
+                process_button("Worker", "control-worker", status.control_worker_running)
+            ],
+            [
+                process_button("Lifecycle", "lifecycle", status.lifecycle_running),
+                json!({"text": "主菜单", "callback_data": "menu"})
+            ]
+        ]
+    })
+}
+
+fn process_button(label: &str, key: &str, running: bool) -> Value {
+    json!({
+        "text": format!("{label} {}", process_state(running)),
+        "callback_data": format!("process:{key}")
+    })
+}
+
+fn process_detail_reply(key: &str) -> Result<BotReply> {
+    let status = lifecycle::status()?;
+    let log_dir = config::config_dir();
+    let (label, running, pids, note) = match key {
+        "codex" => (
+            "Codex APP",
+            status.codex_running,
+            status.codex_pids.clone(),
+            "Codex.app 由系统应用进程管理；Sentinel 只读取线程库和可见窗口状态。".to_string(),
+        ),
+        "gui" => (
+            "Sentinel GUI",
+            status.sentinel_gui_running,
+            status.gui_pids.clone(),
+            format!(
+                "控制台窗口进程。\n日志：{}\n错误：{}",
+                log_dir.join("gui.out.log").display(),
+                log_dir.join("gui.err.log").display()
+            ),
+        ),
+        "daemon" => (
+            "Telegram daemon",
+            status.daemon_running,
+            status.daemon_pids.clone(),
+            format!(
+                "Telegram Bot 与 watcher 主循环。\n日志：{}\n错误：{}",
+                log_dir.join("telegram-daemon.out.log").display(),
+                log_dir.join("telegram-daemon.err.log").display()
+            ),
+        ),
+        "control-worker" => (
+            "Control worker",
+            status.control_worker_running,
+            status.control_worker_pids.clone(),
+            format!(
+                "处理来自 Telegram 和桌面面板的 Codex APP 可见控制队列。\n日志：{}\n错误：{}",
+                log_dir.join("control-worker.out.log").display(),
+                log_dir.join("control-worker.err.log").display()
+            ),
+        ),
+        "lifecycle" => (
+            "Lifecycle",
+            status.lifecycle_running,
+            status.lifecycle_pids.clone(),
+            format!(
+                "跟随 Codex.app 启停 Sentinel 子进程。\nLaunchAgent：{}\n日志：{}\n错误：{}",
+                status.launch_agent_path,
+                log_dir.join("lifecycle.out.log").display(),
+                log_dir.join("lifecycle.err.log").display()
+            ),
+        ),
+        _ => {
+            return Ok(BotReply {
+                text: "未知进程。".to_string(),
+                keyboard: Some(status_keyboard(&status)),
+            });
+        }
+    };
+
+    Ok(BotReply {
+        text: format!(
+            "进程详情\n{}\n\n状态：{}\nPID：{}\n\n{}",
+            label,
+            process_state(running),
+            pid_list(&pids),
+            note
+        ),
+        keyboard: Some(json!({
+            "inline_keyboard": [
+                [{"text": "返回状态", "callback_data": "status"}],
+                [{"text": "主菜单", "callback_data": "menu"}]
+            ]
+        })),
+    })
+}
+
+fn process_state(running: bool) -> &'static str {
+    if running { "运行中" } else { "未运行" }
+}
+
+fn pid_list(pids: &[u32]) -> String {
+    if pids.is_empty() {
+        "-".to_string()
+    } else {
+        pids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn recoverable_reply() -> Result<BotReply> {
@@ -753,16 +910,7 @@ fn auto_recover_reply(value: &str) -> Result<BotReply> {
 }
 
 fn main_keyboard() -> Value {
-    let active = codex::read_recent_threads(1)
-        .ok()
-        .and_then(|threads| threads.first().map(|thread| thread.id.clone()));
     let mut rows = Vec::new();
-    if let Some(thread_id) = active {
-        rows.push(vec![
-            json!({"text": "当前线程", "callback_data": format!("thread:{thread_id}")}),
-            json!({"text": "继续当前", "callback_data": format!("cont:{thread_id}")}),
-        ]);
-    }
     rows.push(vec![
         json!({"text": "新线程", "callback_data": "new"}),
         json!({"text": "选择线程", "callback_data": "threads"}),
@@ -1300,6 +1448,40 @@ mod tests {
     #[test]
     fn pair_text_matches_plain_code() {
         assert!(pair_text_matches("123456", "123456"));
+    }
+
+    #[test]
+    fn main_keyboard_omits_current_thread_shortcuts() {
+        let keyboard = main_keyboard();
+        let raw = serde_json::to_string(&keyboard).unwrap();
+
+        assert!(!raw.contains("当前线程"));
+        assert!(!raw.contains("继续当前"));
+        assert!(raw.contains("选择线程"));
+    }
+
+    #[test]
+    fn status_keyboard_exposes_process_detail_buttons() {
+        let status = lifecycle::LifecycleStatus {
+            codex_running: true,
+            sentinel_gui_running: true,
+            daemon_running: true,
+            control_worker_running: false,
+            lifecycle_running: true,
+            codex_pids: vec![11],
+            gui_pids: vec![22],
+            daemon_pids: vec![33],
+            control_worker_pids: Vec::new(),
+            lifecycle_pids: vec![44],
+            launch_agent_path: "/tmp/local.codex-sentinel.plist".to_string(),
+        };
+        let keyboard = status_keyboard(&status);
+        let raw = serde_json::to_string(&keyboard).unwrap();
+
+        assert!(raw.contains("process:codex"));
+        assert!(raw.contains("process:daemon"));
+        assert!(raw.contains("process:control-worker"));
+        assert!(process_status_text(&status).contains("pid 33"));
     }
 
     #[test]
