@@ -31,6 +31,10 @@ async fn main() -> Result<()> {
             let threads = codex::recoverable_threads(10)?;
             println!("{}", serde_json::to_string_pretty(&threads)?);
         }
+        Some("--running") | Some("running") => {
+            let threads = codex::running_threads(10)?;
+            println!("{}", serde_json::to_string_pretty(&threads)?);
+        }
         Some("--daemon") | Some("daemon") => {
             let cfg = config::load_or_create()?;
             telegram::run_bot(cfg).await?;
@@ -186,6 +190,7 @@ fn print_help() {
            codex-sentinel              Open desktop status window\n\
            codex-sentinel status       Print JSON status\n\
            codex-sentinel recoverable  Print recoverable recent threads\n\
+           codex-sentinel running      Print running recent threads\n\
            codex-sentinel daemon       Run Telegram bot loop\n\
            codex-sentinel control-worker Run queued Codex APP control requests\n\
            codex-sentinel lifecycle    Follow Codex.app and manage Sentinel GUI/daemon\n\

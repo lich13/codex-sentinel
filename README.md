@@ -144,6 +144,7 @@ CLI 保留为诊断和打包验证入口，不作为主要交互面：
 ```sh
 codex-sentinel status
 codex-sentinel recoverable
+codex-sentinel running
 codex-sentinel daemon
 codex-sentinel lifecycle
 codex-sentinel lifecycle-status

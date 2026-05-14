@@ -19,6 +19,7 @@ const THREAD_RECOVERY_LOOKBACK_SECONDS: i64 = 600;
 const THREAD_RECOVERY_MAX_LOOKBACK_SECONDS: i64 = 2 * 60 * 60;
 const THREAD_TERMINAL_QUIET_SECONDS: i64 = 30;
 const THREAD_EVENT_UPDATED_AT_GRACE_SECONDS: i64 = 60;
+const THREAD_RUNNING_LOG_WINDOW_SECONDS: i64 = 120;
 const STATUS_LOG_LOOKBACK_SECONDS: i64 = 24 * 60 * 60;
 const ROLLOUT_RECOVERY_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 const ROLLOUT_FEEDBACK_SCAN_BYTES: u64 = 1024 * 1024;
@@ -459,6 +460,8 @@ pub fn recoverable_threads(limit: usize) -> Result<Vec<ThreadRecovery>> {
 }
 
 pub fn running_threads(limit: usize) -> Result<Vec<RunningThread>> {
+    let now_ts = Utc::now().timestamp();
+    let running_activity_since = now_ts.saturating_sub(THREAD_RUNNING_LOG_WINDOW_SECONDS);
     let recent_threads = read_recent_threads(limit)?;
     let thread_ids = recent_threads
         .iter()
@@ -472,26 +475,112 @@ pub fn running_threads(limit: usize) -> Result<Vec<RunningThread>> {
 
     let mut running = Vec::new();
     for thread in recent_threads {
+        let latest_running_activity_ts =
+            match latest_running_log_activity_for_thread(&thread.id, running_activity_since) {
+                Ok(activity) => activity,
+                Err(err) => {
+                    tracing::debug!(
+                        thread_id = %thread.id,
+                        "running thread log fallback skipped: {err:#}"
+                    );
+                    None
+                }
+            };
         if let Some(probe) = app_server_probes.get(&thread.id) {
-            if let Some(item) = running_thread_from_probe(thread, probe) {
+            if let Some(item) = running_thread_from_probe_with_activity(
+                thread,
+                probe,
+                latest_running_activity_ts,
+                now_ts,
+            ) {
                 running.push(item);
             }
+        } else if let Some(item) =
+            running_thread_from_log_activity(thread, latest_running_activity_ts, now_ts)
+        {
+            running.push(item);
         }
     }
     Ok(running)
 }
 
+#[cfg(test)]
 fn running_thread_from_probe(thread: ThreadSummary, probe: &ThreadProbe) -> Option<RunningThread> {
-    if !probe.is_known_running() {
+    running_thread_from_probe_with_activity(thread, probe, None, Utc::now().timestamp())
+}
+
+fn running_thread_from_probe_with_activity(
+    thread: ThreadSummary,
+    probe: &ThreadProbe,
+    latest_running_activity_ts: Option<i64>,
+    now_ts: i64,
+) -> Option<RunningThread> {
+    if probe.is_known_running() {
+        return Some(RunningThread {
+            thread,
+            thread_status: probe.thread_status.clone(),
+            turn_id: probe.latest_turn_id.clone(),
+            turn_status: probe.latest_turn_status.clone(),
+            started_at: probe.latest_turn_started_at,
+        });
+    }
+
+    let activity_ts = latest_running_activity_ts?;
+    if !fresh_running_log_activity(activity_ts, now_ts) {
+        return None;
+    }
+    if !probe_has_unfinished_nonfailed_turn(probe) {
+        return None;
+    }
+    if probe.latest_turn_started_at.is_some_and(|started_at| {
+        activity_ts < started_at.saturating_sub(THREAD_EVENT_UPDATED_AT_GRACE_SECONDS)
+    }) {
+        return None;
+    }
+
+    Some(RunningThread {
+        thread,
+        thread_status: probe
+            .thread_status
+            .as_deref()
+            .map(|status| format!("{status}+logActive"))
+            .or_else(|| Some("logActive".to_string())),
+        turn_id: probe.latest_turn_id.clone(),
+        turn_status: probe
+            .latest_turn_status
+            .as_deref()
+            .map(|status| format!("{status}+logActive"))
+            .or_else(|| Some("logActive".to_string())),
+        started_at: probe.latest_turn_started_at.or(Some(activity_ts)),
+    })
+}
+
+fn running_thread_from_log_activity(
+    thread: ThreadSummary,
+    latest_running_activity_ts: Option<i64>,
+    now_ts: i64,
+) -> Option<RunningThread> {
+    let activity_ts = latest_running_activity_ts?;
+    if !fresh_running_log_activity(activity_ts, now_ts) {
         return None;
     }
     Some(RunningThread {
         thread,
-        thread_status: probe.thread_status.clone(),
-        turn_id: probe.latest_turn_id.clone(),
-        turn_status: probe.latest_turn_status.clone(),
-        started_at: probe.latest_turn_started_at,
+        thread_status: Some("logActive".to_string()),
+        turn_id: None,
+        turn_status: Some("logActive".to_string()),
+        started_at: Some(activity_ts),
     })
+}
+
+fn fresh_running_log_activity(activity_ts: i64, now_ts: i64) -> bool {
+    now_ts.saturating_sub(activity_ts) <= THREAD_RUNNING_LOG_WINDOW_SECONDS
+}
+
+fn probe_has_unfinished_nonfailed_turn(probe: &ThreadProbe) -> bool {
+    probe.latest_turn_id.is_some()
+        && probe.latest_turn_completed_at.is_none()
+        && !probe.has_terminal_failure()
 }
 
 fn latest_recovery_event_for_thread(
@@ -665,6 +754,10 @@ fn latest_log_activity_for_thread(thread_id: &str, since_ts: i64) -> Result<Opti
     latest_log_activity_for_thread_from_db(&logs_db_path(), thread_id, since_ts)
 }
 
+fn latest_running_log_activity_for_thread(thread_id: &str, since_ts: i64) -> Result<Option<i64>> {
+    latest_running_log_activity_for_thread_from_db(&logs_db_path(), thread_id, since_ts)
+}
+
 fn latest_log_activity_for_thread_from_db(
     db_path: &Path,
     thread_id: &str,
@@ -690,6 +783,49 @@ fn latest_log_activity_for_thread_from_db(
          LIMIT 1"
     );
     let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query((
+        &since_ts,
+        thread_id,
+        &patterns[0],
+        &patterns[1],
+        &patterns[2],
+    ))?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn latest_running_log_activity_for_thread_from_db(
+    db_path: &Path,
+    thread_id: &str,
+    since_ts: i64,
+) -> Result<Option<i64>> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", db_path.display()))?;
+    let patterns = thread_match_patterns(thread_id);
+    let sql = "SELECT ts \
+         FROM logs \
+         WHERE ts >= ?1 \
+           AND (thread_id = ?2 \
+                OR ((thread_id IS NULL OR thread_id = '') \
+                    AND (feedback_log_body LIKE ?3 \
+                         OR feedback_log_body LIKE ?4 \
+                         OR feedback_log_body LIKE ?5))) \
+           AND (feedback_log_body LIKE '%response.in_progress%' \
+                OR feedback_log_body LIKE '%response.created%' \
+                OR feedback_log_body LIKE '%response.output_item.added%' \
+                OR feedback_log_body LIKE '%response.output_text.delta%' \
+                OR feedback_log_body LIKE '%run_sampling_request%' \
+                OR feedback_log_body LIKE '%codex.tool_call%' \
+                OR feedback_log_body LIKE '%event.name=\"codex.sse_event\"%event.kind=response.output%') \
+         ORDER BY ts DESC, ts_nanos DESC, id DESC \
+         LIMIT 1";
+    let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query((
         &since_ts,
         thread_id,
@@ -1640,6 +1776,62 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_unfinished_turn_with_fresh_running_log_is_displayed_as_running() {
+        let thread = thread_summary("thread-a");
+        let probe = ThreadProbe {
+            thread_id: "thread-a".to_string(),
+            thread_status: Some("notLoaded".to_string()),
+            latest_turn_id: Some("turn-a".to_string()),
+            latest_turn_status: Some("interrupted".to_string()),
+            latest_turn_error: None,
+            latest_turn_started_at: Some(1778303600),
+            latest_turn_completed_at: None,
+            source: "test".to_string(),
+        };
+
+        let running = running_thread_from_probe_with_activity(
+            thread.clone(),
+            &probe,
+            Some(1778303655),
+            1778303660,
+        )
+        .expect("fresh running log activity should override stale interrupted probe state");
+
+        assert_eq!(running.thread.id, "thread-a");
+        assert_eq!(running.turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(
+            running.turn_status.as_deref(),
+            Some("interrupted+logActive")
+        );
+
+        assert!(
+            running_thread_from_probe_with_activity(
+                thread.clone(),
+                &probe,
+                Some(1778303400),
+                1778303660
+            )
+            .is_none(),
+            "stale activity must not be shown as running"
+        );
+
+        let completed_probe = ThreadProbe {
+            latest_turn_completed_at: Some(1778303660),
+            ..probe
+        };
+        assert!(
+            running_thread_from_probe_with_activity(
+                thread,
+                &completed_probe,
+                Some(1778303655),
+                1778303660
+            )
+            .is_none(),
+            "completed turns must not be shown as running from log activity"
+        );
+    }
+
+    #[test]
     fn visible_submit_confirmation_uses_short_fast_probe_window() {
         assert!(VISIBLE_SUBMIT_FAST_PROBE_WAIT <= Duration::from_secs(2));
         assert!(VISIBLE_SUBMIT_DB_WAIT <= Duration::from_secs(3));
@@ -2180,6 +2372,42 @@ mod tests {
         assert_eq!(activity, Some(1778303660));
 
         let stale = latest_log_activity_for_thread_from_db(&db, "thread-a", 1778303661)
+            .expect("lookup succeeds");
+        assert!(stale.is_none());
+
+        let _ = fs::remove_file(db);
+    }
+
+    #[test]
+    fn running_log_activity_matches_only_active_stream_events() {
+        let db = temp_db_path("running-log-activity");
+        let conn = Connection::open(&db).expect("create temp db");
+        create_logs_table(&conn);
+        conn.execute(
+            "INSERT INTO logs (id, ts, ts_nanos, level, target, thread_id, feedback_log_body)
+             VALUES (1, 1778303650, 1, 'INFO', 'codex_core::session::turn', 'thread-a', ?1)",
+            ["Turn error: temporary gateway error"],
+        )
+        .expect("insert non-running noise");
+        conn.execute(
+            "INSERT INTO logs (id, ts, ts_nanos, level, target, thread_id, feedback_log_body)
+             VALUES (2, 1778303660, 1, 'INFO', 'codex_otel.log_only', NULL, ?1)",
+            ["event.name=\"codex.sse_event\" event.kind=response.in_progress conversation.id=thread-a"],
+        )
+        .expect("insert running event");
+        conn.execute(
+            "INSERT INTO logs (id, ts, ts_nanos, level, target, thread_id, feedback_log_body)
+             VALUES (3, 1778303670, 1, 'INFO', 'codex_core::session::turn', 'thread-b', ?1)",
+            ["run_sampling_request{turn_id=turn-b}"],
+        )
+        .expect("insert other thread running event");
+        drop(conn);
+
+        let activity = latest_running_log_activity_for_thread_from_db(&db, "thread-a", 1778303640)
+            .expect("lookup succeeds");
+        assert_eq!(activity, Some(1778303660));
+
+        let stale = latest_running_log_activity_for_thread_from_db(&db, "thread-a", 1778303661)
             .expect("lookup succeeds");
         assert!(stale.is_none());
 
