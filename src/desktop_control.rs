@@ -37,7 +37,7 @@ const EXISTING_THREAD_RIGHT_PANEL_WIDTH: f64 = 420.0;
 const EXISTING_THREAD_COMPOSER_MAX_WIDTH: f64 = 980.0;
 
 #[cfg(target_os = "macos")]
-use core_foundation::base::{CFType, TCFType};
+use core_foundation::base::{Boolean, CFType, CFTypeRef, TCFType};
 #[cfg(target_os = "macos")]
 use core_foundation::boolean::CFBoolean;
 #[cfg(target_os = "macos")]
@@ -69,7 +69,29 @@ use sysinfo::System;
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> u8;
     fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
+    fn AXUIElementCreateApplication(pid: libc::pid_t) -> AXUIElementRef;
+    fn AXUIElementCopyAttributeValue(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        value: *mut CFTypeRef,
+    ) -> i32;
+    fn AXUIElementIsAttributeSettable(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        settable: *mut Boolean,
+    ) -> i32;
+    fn AXUIElementSetAttributeValue(
+        element: AXUIElementRef,
+        attribute: CFStringRef,
+        value: CFTypeRef,
+    ) -> i32;
 }
+
+#[cfg(target_os = "macos")]
+type AXUIElementRef = CFTypeRef;
+
+#[cfg(target_os = "macos")]
+const AX_ERROR_SUCCESS: i32 = 0;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -1165,15 +1187,48 @@ fn post_command_n(pid: i32) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn clear_current_input(pid: i32, attempt: usize) -> Result<()> {
-    for _ in 0..clear_passes(attempt) {
-        clear_focused_text_line(pid)?;
-        std::thread::sleep(COMPOSER_CLEAR_PASS_SETTLE);
-        for keycode in safe_clear_keycodes(attempt) {
-            post_key_press(pid, keycode, CGEventFlags::empty())?;
+    for step in clear_input_steps(attempt) {
+        match step {
+            ClearInputStep::AccessibilityFocusedValueReset => {
+                let _ = clear_focused_accessibility_value(pid);
+            }
+            ClearInputStep::KeyboardLineClear => {
+                clear_focused_text_line(pid)?;
+            }
+            ClearInputStep::DeleteKey => {
+                post_key_press(pid, KeyCode::DELETE, CGEventFlags::empty())?;
+            }
+            ClearInputStep::ForwardDeleteKey => {
+                post_key_press(pid, KeyCode::FORWARD_DELETE, CGEventFlags::empty())?;
+            }
         }
         std::thread::sleep(COMPOSER_CLEAR_PASS_SETTLE);
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearInputStep {
+    AccessibilityFocusedValueReset,
+    KeyboardLineClear,
+    DeleteKey,
+    ForwardDeleteKey,
+}
+
+#[cfg(target_os = "macos")]
+fn clear_input_steps(attempt: usize) -> Vec<ClearInputStep> {
+    let mut steps = vec![ClearInputStep::AccessibilityFocusedValueReset];
+    for _ in 0..clear_passes(attempt) {
+        steps.push(ClearInputStep::KeyboardLineClear);
+        for keycode in safe_clear_keycodes(attempt) {
+            steps.push(match keycode {
+                KeyCode::FORWARD_DELETE => ClearInputStep::ForwardDeleteKey,
+                _ => ClearInputStep::DeleteKey,
+            });
+        }
+    }
+    steps
 }
 
 #[cfg(target_os = "macos")]
@@ -1201,6 +1256,54 @@ fn dismiss_input_overlays(pid: i32) -> Result<()> {
 fn clear_focused_text_line(pid: i32) -> Result<()> {
     post_control_key_press(pid, KeyCode::ANSI_A)?;
     post_control_key_press(pid, KeyCode::ANSI_K)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_focused_accessibility_value(pid: i32) -> Result<()> {
+    let app = unsafe { AXUIElementCreateApplication(pid as libc::pid_t) };
+    if app.is_null() {
+        return Err(anyhow!("failed to create AX application element"));
+    }
+    let _app_guard = unsafe { CFType::wrap_under_create_rule(app) };
+    let focused_attribute = CFString::from_static_string("AXFocusedUIElement");
+    let mut focused: CFTypeRef = std::ptr::null();
+    let copy_result = unsafe {
+        AXUIElementCopyAttributeValue(app, focused_attribute.as_concrete_TypeRef(), &mut focused)
+    };
+    if copy_result != AX_ERROR_SUCCESS || focused.is_null() {
+        return Err(anyhow!("failed to read AXFocusedUIElement: {copy_result}"));
+    }
+    let _focused_guard = unsafe { CFType::wrap_under_create_rule(focused) };
+    clear_accessibility_element_value(focused)
+}
+
+#[cfg(target_os = "macos")]
+fn clear_accessibility_element_value(element: AXUIElementRef) -> Result<()> {
+    let value_attribute = CFString::from_static_string("AXValue");
+    let mut settable: Boolean = 0;
+    let settable_result = unsafe {
+        AXUIElementIsAttributeSettable(
+            element,
+            value_attribute.as_concrete_TypeRef(),
+            &mut settable,
+        )
+    };
+    if settable_result != AX_ERROR_SUCCESS || settable == 0 {
+        return Err(anyhow!("AXValue is not settable: {settable_result}"));
+    }
+    let empty = CFString::from_static_string("");
+    let set_result = unsafe {
+        AXUIElementSetAttributeValue(
+            element,
+            value_attribute.as_concrete_TypeRef(),
+            empty.as_CFTypeRef(),
+        )
+    };
+    if set_result == AX_ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(anyhow!("failed to clear AXValue: {set_result}"))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1396,6 +1499,18 @@ mod tests {
         );
         assert_eq!(KeyCode::ANSI_A, 0);
         assert_eq!(KeyCode::ANSI_K, 40);
+    }
+
+    #[test]
+    fn clear_current_input_prioritizes_accessibility_value_reset() {
+        let steps = clear_input_steps(1);
+        assert_eq!(
+            steps.first(),
+            Some(&ClearInputStep::AccessibilityFocusedValueReset)
+        );
+        assert!(steps.contains(&ClearInputStep::KeyboardLineClear));
+        assert!(steps.contains(&ClearInputStep::DeleteKey));
+        assert!(steps.contains(&ClearInputStep::ForwardDeleteKey));
     }
 
     #[test]
