@@ -24,7 +24,9 @@ const ROLLOUT_RECOVERY_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 const ROLLOUT_FEEDBACK_SCAN_BYTES: u64 = 1024 * 1024;
 const ROLLOUT_MAX_PARSE_LINE_BYTES: usize = 512 * 1024;
 const VISIBLE_SUBMIT_ATTEMPTS: usize = 4;
-const VISIBLE_SUBMIT_WAIT: Duration = Duration::from_secs(8);
+const VISIBLE_SUBMIT_WAIT: Duration = Duration::from_secs(5);
+const VISIBLE_SUBMIT_FAST_PROBE_WAIT: Duration = Duration::from_millis(1_600);
+const VISIBLE_SUBMIT_DB_WAIT: Duration = Duration::from_millis(2_400);
 const VISIBLE_SUBMIT_PROBE_GRACE_SECONDS: i64 = 2;
 const RECOVERY_LOG_TARGETS: &str = "(target IN ('codex_core::session::turn', 'codex_client::transport') \
           OR (target IN ('codex_otel.trace_safe', 'codex_otel.log_only') \
@@ -1246,6 +1248,7 @@ pub fn continue_thread(thread_id: &str, prompt: &str) -> Result<String> {
 
     for attempt in 0..VISIBLE_SUBMIT_ATTEMPTS {
         let attempt_started_at = Utc::now().timestamp();
+        let started = Instant::now();
         desktop_control::submit_prompt_to_visible_window(prompt, attempt)?;
         if wait_for_thread_submission(
             thread_id,
@@ -1254,8 +1257,20 @@ pub fn continue_thread(thread_id: &str, prompt: &str) -> Result<String> {
             attempt_started_at,
             VISIBLE_SUBMIT_WAIT,
         )? {
+            tracing::info!(
+                thread_id,
+                attempt,
+                elapsed_ms = started.elapsed().as_millis(),
+                "visible continue submission confirmed"
+            );
             return Ok(desktop_control::visible_turn_id());
         }
+        tracing::warn!(
+            thread_id,
+            attempt,
+            elapsed_ms = started.elapsed().as_millis(),
+            "visible continue submission attempt was not confirmed"
+        );
     }
 
     Err(anyhow!(
@@ -1270,7 +1285,24 @@ fn wait_for_thread_submission(
     attempt_started_at: i64,
     timeout: Duration,
 ) -> Result<bool> {
-    if wait_for_thread_update(thread_id, baseline_updated_at_ms, timeout)? {
+    let fast_deadline = Instant::now() + VISIBLE_SUBMIT_FAST_PROBE_WAIT.min(timeout);
+    while Instant::now() < fast_deadline {
+        let probe = app_server_probe::read_thread_probe(thread_id)
+            .ok()
+            .flatten();
+        if probe.as_ref().is_some_and(|probe| {
+            thread_probe_confirms_submission(probe, baseline_probe, attempt_started_at)
+        }) {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(180));
+    }
+
+    if wait_for_thread_update(
+        thread_id,
+        baseline_updated_at_ms,
+        VISIBLE_SUBMIT_DB_WAIT.min(timeout),
+    )? {
         return Ok(true);
     }
 
@@ -1525,6 +1557,13 @@ mod tests {
             source: "test".to_string(),
         };
         assert!(running_thread_from_probe(thread, &completed_probe).is_none());
+    }
+
+    #[test]
+    fn visible_submit_confirmation_uses_short_fast_probe_window() {
+        assert!(VISIBLE_SUBMIT_FAST_PROBE_WAIT <= Duration::from_secs(2));
+        assert!(VISIBLE_SUBMIT_DB_WAIT <= Duration::from_secs(3));
+        assert!(VISIBLE_SUBMIT_WAIT <= Duration::from_secs(5));
     }
 
     #[test]

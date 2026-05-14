@@ -18,13 +18,13 @@ use image::GenericImageView;
 use serde::Serialize;
 
 #[cfg(target_os = "macos")]
-const EXISTING_THREAD_OPEN_SETTLE: Duration = Duration::from_millis(2_200);
+const EXISTING_THREAD_OPEN_SETTLE: Duration = Duration::from_millis(800);
 #[cfg(target_os = "macos")]
-const COMPOSER_AFTER_FOCUS_SETTLE: Duration = Duration::from_millis(220);
+const COMPOSER_AFTER_FOCUS_SETTLE: Duration = Duration::from_millis(160);
 #[cfg(target_os = "macos")]
 const COMPOSER_AFTER_CLEAR_SETTLE: Duration = Duration::from_millis(120);
 #[cfg(target_os = "macos")]
-const COMPOSER_AFTER_INSERT_SETTLE: Duration = Duration::from_millis(260);
+const COMPOSER_AFTER_INSERT_SETTLE: Duration = Duration::from_millis(170);
 #[cfg(target_os = "macos")]
 const POST_SEND_SETTLE: Duration = Duration::from_millis(520);
 #[cfg(target_os = "macos")]
@@ -1414,6 +1414,13 @@ mod tests {
         assert!((points[0].x - 1144.0).abs() <= 2.0);
         assert!((points[1].x - 1354.0).abs() <= 2.0);
         assert!(points.iter().all(|point| (point.y - 1196.0).abs() <= 2.0));
+    }
+
+    #[test]
+    fn existing_thread_open_settle_is_short() {
+        assert!(EXISTING_THREAD_OPEN_SETTLE <= Duration::from_millis(900));
+        assert!(COMPOSER_AFTER_FOCUS_SETTLE <= Duration::from_millis(180));
+        assert!(COMPOSER_AFTER_INSERT_SETTLE <= Duration::from_millis(180));
     }
 
     #[test]

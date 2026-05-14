@@ -9,11 +9,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::codex;
 use crate::config::{self, AppConfig};
 use crate::maintenance;
 use crate::recovery::{RecoveryDecision, RecoveryKind, classify_error, sanitized_recovery_text};
 use crate::telegram;
+use crate::{codex, control_queue};
 
 const SENTINEL_MARKER: &str = "codex-sentinel";
 const STOP_TIMEOUT_SECONDS: u64 = 240;
@@ -217,12 +217,14 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
     let body_hash = stable_hash_hex(&[&classification.body]);
     let event_key = stop_event_key(&input, &classification, &body_hash);
     let duplicate = recent_key_seen(&event_key, STOP_HOOK_DEDUP_WINDOW_SECONDS).unwrap_or(false);
+    let queued_recovery = stop_hook_recovery_request(&input, &cfg, &classification, duplicate);
     let response = stop_hook_response(
         &input,
         &cfg,
         &classification.decision,
         should_sleep_in_hook(),
         duplicate,
+        queued_recovery.is_some(),
     )?;
     let action = stop_hook_action(&input, &cfg, &classification, duplicate);
     let completion_duplicate = if action == "completed" {
@@ -246,6 +248,12 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
     if should_write_cooldown_key(&classification, action) {
         if let Err(err) = append_hook_cooldown_key(&cfg, &event_key) {
             tracing::warn!("failed to write Stop hook cooldown key: {err:#}");
+        }
+    }
+    if let Some(request) = queued_recovery {
+        if let Err(err) = control_queue::enqueue_action(request.action.clone(), request.not_before)
+        {
+            tracing::warn!("failed to enqueue Stop hook recovery request: {err:#}");
         }
     }
     if action == "completed"
@@ -483,6 +491,7 @@ fn stop_hook_response(
     decision: &RecoveryDecision,
     allow_sleep: bool,
     duplicate: bool,
+    queued_recovery: bool,
 ) -> Result<Value> {
     if input.stop_hook_active.unwrap_or(false) {
         return Ok(json!({
@@ -506,6 +515,13 @@ fn stop_hook_response(
         return Ok(json!({
             "continue": false,
             "systemMessage": format!("Codex Sentinel 检测到「{}」，但自动恢复已关闭或此类问题需要人工处理：{}", decision.label, decision.reason)
+        }));
+    }
+
+    if queued_recovery {
+        return Ok(json!({
+            "continue": false,
+            "systemMessage": format!("Codex Sentinel 检测到「{}」，已交给可见窗口恢复队列处理。", decision.label)
         }));
     }
 
@@ -557,6 +573,59 @@ fn continuation_prompt(cfg: &AppConfig, decision: &RecoveryDecision) -> String {
 
 fn should_sleep_in_hook() -> bool {
     std::env::var_os("CODEX_SENTINEL_SKIP_HOOK_SLEEP").is_none()
+}
+
+fn stop_hook_recovery_request(
+    input: &HookInput,
+    cfg: &AppConfig,
+    classification: &StopClassification,
+    duplicate: bool,
+) -> Option<control_queue::ControlRequest> {
+    let decision = &classification.decision;
+    if input.stop_hook_active.unwrap_or(false)
+        || duplicate
+        || !cfg.recovery.auto_recover
+        || !decision.auto_allowed
+        || matches!(decision.kind, RecoveryKind::None | RecoveryKind::Reauth)
+    {
+        return None;
+    }
+    let thread_id = input
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())?;
+    let not_before = if decision.delay_seconds > STOP_HOOK_MAX_INLINE_DELAY_SECONDS {
+        Some(
+            Utc::now()
+                .timestamp()
+                .saturating_add(decision.delay_seconds as i64),
+        )
+    } else {
+        None
+    };
+    Some(control_queue::ControlRequest {
+        id: String::new(),
+        created_at: Utc::now().timestamp(),
+        not_before,
+        action: control_queue::ControlAction::Continue {
+            thread_id: thread_id.to_string(),
+            prompt: recovery_prompt_for_request(cfg, decision),
+        },
+    })
+}
+
+fn recovery_prompt_for_request(cfg: &AppConfig, decision: &RecoveryDecision) -> String {
+    let prompt = match decision.kind {
+        RecoveryKind::ToolRetryWithDifferentPath => &cfg.recovery.tool_failure_prompt,
+        RecoveryKind::SafetyRephrase => &cfg.recovery.safety_rephrase_prompt,
+        _ => &cfg.recovery.continue_prompt,
+    };
+    if decision.kind == RecoveryKind::SafetyRephrase {
+        sanitized_recovery_text(prompt)
+    } else {
+        prompt.to_string()
+    }
 }
 
 fn read_codex_hooks_feature(path: &Path) -> Result<bool> {
@@ -1512,7 +1581,7 @@ mod tests {
             ),
         };
         let decision = classify_error(input.last_assistant_message.as_deref().unwrap());
-        let response = stop_hook_response(&input, &cfg, &decision, false, false).unwrap();
+        let response = stop_hook_response(&input, &cfg, &decision, false, false, false).unwrap();
         let reason = response
             .get("reason")
             .and_then(Value::as_str)
@@ -1584,7 +1653,7 @@ mod tests {
             last_assistant_message: Some("Turn error: 503 Service Unavailable".to_string()),
         };
         let decision = classify_error(input.last_assistant_message.as_deref().unwrap());
-        let response = stop_hook_response(&input, &cfg, &decision, false, true).unwrap();
+        let response = stop_hook_response(&input, &cfg, &decision, false, true, false).unwrap();
 
         assert_eq!(
             response.get("continue").and_then(Value::as_bool),
@@ -1645,7 +1714,7 @@ mod tests {
             label: "Long backoff".to_string(),
             reason: "wait longer outside the Stop hook".to_string(),
         };
-        let response = stop_hook_response(&input, &cfg, &decision, false, false).unwrap();
+        let response = stop_hook_response(&input, &cfg, &decision, false, false, false).unwrap();
 
         assert_eq!(
             response.get("continue").and_then(Value::as_bool),
@@ -1664,6 +1733,98 @@ mod tests {
             stop_hook_action(&input, &cfg, &classification, false),
             "deferred"
         );
+    }
+
+    #[test]
+    fn recoverable_stop_hook_enqueues_visible_recovery_request() {
+        let mut cfg = AppConfig::default();
+        cfg.recovery.continue_prompt = "继续".to_string();
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: Some("thread-a".to_string()),
+            transcript_path: None,
+            cwd: None,
+            model: None,
+            turn_id: Some("turn-a".to_string()),
+            stop_hook_active: Some(false),
+            last_assistant_message: Some(
+                "Turn error: unexpected status 503 Service Unavailable".to_string(),
+            ),
+        };
+        let classification = classify_stop_input(&input);
+
+        let request = stop_hook_recovery_request(&input, &cfg, &classification, false)
+            .expect("non-duplicate recoverable hook should enqueue a visible recovery");
+
+        assert_eq!(
+            request.action,
+            crate::control_queue::ControlAction::Continue {
+                thread_id: "thread-a".to_string(),
+                prompt: "继续".to_string()
+            }
+        );
+        assert_eq!(request.not_before, None);
+    }
+
+    #[test]
+    fn queued_recovery_stop_hook_response_does_not_inline_continue() {
+        let cfg = AppConfig::default();
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: Some("thread-a".to_string()),
+            transcript_path: None,
+            cwd: None,
+            model: None,
+            turn_id: Some("turn-a".to_string()),
+            stop_hook_active: Some(false),
+            last_assistant_message: Some(
+                "Turn error: unexpected status 503 Service Unavailable".to_string(),
+            ),
+        };
+        let decision = classify_error(input.last_assistant_message.as_deref().unwrap());
+
+        let response = stop_hook_response(&input, &cfg, &decision, false, false, true)
+            .expect("queued recovery response should be generated");
+
+        assert_eq!(
+            response.get("continue").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            response
+                .get("systemMessage")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("可见窗口恢复队列")
+        );
+    }
+
+    #[test]
+    fn long_delay_stop_hook_enqueue_has_not_before() {
+        let cfg = AppConfig::default();
+        let input = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            session_id: Some("thread-a".to_string()),
+            transcript_path: None,
+            cwd: None,
+            model: None,
+            turn_id: Some("turn-a".to_string()),
+            stop_hook_active: Some(false),
+            last_assistant_message: None,
+        };
+        let decision = RecoveryDecision {
+            kind: RecoveryKind::RetryLater,
+            auto_allowed: true,
+            delay_seconds: 30,
+            label: "Long backoff".to_string(),
+            reason: "wait outside hook".to_string(),
+        };
+        let classification = stop_classification(&input, decision, "codex_log_fallback", "body");
+
+        let request = stop_hook_recovery_request(&input, &cfg, &classification, false)
+            .expect("long-delay hook should enqueue a delayed visible recovery");
+
+        assert!(request.not_before.unwrap() >= Utc::now().timestamp() + 29);
     }
 
     #[test]

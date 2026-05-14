@@ -12,8 +12,9 @@ use crate::config::AppConfig;
 use crate::recovery::{RecoveryDecision, RecoveryKind, sanitized_recovery_text};
 use crate::{codex, config, control_queue, desktop_control};
 
-const TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS: u64 = 15;
-const TELEGRAM_HTTP_TIMEOUT_SECONDS: u64 = 25;
+const TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS: u64 = 10;
+const TELEGRAM_HTTP_TIMEOUT_SECONDS: u64 = 12;
+const TELEGRAM_ERROR_BACKOFF_SECONDS: u64 = 2;
 const RECOVERY_FAILURE_BACKOFF_SECONDS: u64 = 60;
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +100,7 @@ pub async fn run_bot(cfg: AppConfig) -> Result<()> {
                     error = %redact_telegram_token(&format!("{err:#}")),
                     "telegram getUpdates failed"
                 );
-                sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(TELEGRAM_ERROR_BACKOFF_SECONDS)).await;
                 continue;
             }
         };
@@ -111,7 +112,7 @@ pub async fn run_bot(cfg: AppConfig) -> Result<()> {
                 error = %redact_telegram_token(&description),
                 "telegram getUpdates returned ok=false"
             );
-            sleep(Duration::from_secs(5)).await;
+            sleep(Duration::from_secs(TELEGRAM_ERROR_BACKOFF_SECONDS)).await;
             continue;
         }
 
@@ -1429,5 +1430,12 @@ mod tests {
         };
         assert!(!counter.failure_backoff_active());
         assert!(counter.can_run(10, 5));
+    }
+
+    #[test]
+    fn telegram_timeouts_are_responsive() {
+        assert!(TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS <= 10);
+        assert!(TELEGRAM_HTTP_TIMEOUT_SECONDS <= 12);
+        assert!(TELEGRAM_ERROR_BACKOFF_SECONDS <= 2);
     }
 }
