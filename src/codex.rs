@@ -105,6 +105,7 @@ pub struct ThreadFeedback {
     pub title: String,
     pub timestamp: Option<String>,
     pub text: String,
+    pub internal_thread: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,13 +187,16 @@ pub fn read_recent_threads(limit: usize) -> Result<Vec<ThreadSummary>> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("failed to open {}", db_path.display()))?;
-    let mut stmt = conn.prepare(
+    let visibility_filter = user_visible_thread_filter_sql(&conn)?;
+    let sql = format!(
         "SELECT id, \
                 title, cwd, updated_at, rollout_path \
          FROM threads \
          WHERE coalesce(archived, 0) = 0 \
-         ORDER BY updated_at DESC LIMIT ?1",
-    )?;
+         {visibility_filter} \
+         ORDER BY updated_at DESC LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([limit as i64], |row| {
         Ok(ThreadSummary {
             id: row.get(0)?,
@@ -239,6 +243,98 @@ fn read_thread(conn: &Connection, thread_id: &str) -> Result<ThreadSummary> {
         },
     )
     .with_context(|| format!("thread not found: {thread_id}"))
+}
+
+fn read_user_visible_thread(conn: &Connection, thread_id: &str) -> Result<ThreadSummary> {
+    let visibility_filter = user_visible_thread_filter_sql(conn)?;
+    let sql = format!(
+        "SELECT id, title, cwd, updated_at, rollout_path \
+         FROM threads WHERE id = ?1 {visibility_filter}"
+    );
+    conn.query_row(&sql, [thread_id], |row| {
+        Ok(ThreadSummary {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            cwd: row.get(2)?,
+            updated_at: row.get(3)?,
+            rollout_path: row.get(4)?,
+        })
+    })
+    .with_context(|| format!("user-visible thread not found: {thread_id}"))
+}
+
+pub fn is_internal_thread(thread_id: &str) -> Result<bool> {
+    let db_path = state_db_path();
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", db_path.display()))?;
+    let Some((thread_source, source)) = read_thread_visibility_metadata(&conn, thread_id)? else {
+        return Ok(false);
+    };
+    Ok(internal_thread_from_metadata(
+        thread_source.as_deref(),
+        source.as_deref(),
+    ))
+}
+
+fn user_visible_thread_filter_sql(conn: &Connection) -> Result<String> {
+    let columns = thread_table_columns(conn)?;
+    let mut clauses = Vec::new();
+    if columns.contains("thread_source") {
+        clauses.push("coalesce(thread_source, '') != 'subagent'");
+    }
+    if columns.contains("source") {
+        clauses.push("coalesce(source, '') NOT LIKE '%\"subagent\"%'");
+    }
+    if clauses.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!("AND {}", clauses.join(" AND ")))
+}
+
+fn read_thread_visibility_metadata(
+    conn: &Connection,
+    thread_id: &str,
+) -> Result<Option<(Option<String>, Option<String>)>> {
+    let columns = thread_table_columns(conn)?;
+    let thread_source_expr = if columns.contains("thread_source") {
+        "thread_source"
+    } else {
+        "NULL"
+    };
+    let source_expr = if columns.contains("source") {
+        "source"
+    } else {
+        "NULL"
+    };
+    let sql = format!("SELECT {thread_source_expr}, {source_expr} FROM threads WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([thread_id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some((row.get(0)?, row.get(1)?)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn internal_thread_from_metadata(thread_source: Option<&str>, source: Option<&str>) -> bool {
+    thread_source
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("subagent"))
+        || source.is_some_and(|value| value.contains("\"subagent\""))
+}
+
+fn thread_table_columns(conn: &Connection) -> Result<HashSet<String>> {
+    table_columns(conn, "PRAGMA table_info(threads)")
+}
+
+fn table_columns(conn: &Connection, pragma_sql: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(pragma_sql)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    rows.collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(Into::into)
 }
 
 pub fn archive_thread(thread_id: &str) -> Result<ThreadMutationResult> {
@@ -316,9 +412,11 @@ pub fn latest_log_like(where_clause: &str) -> Result<Option<LogEvent>> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("failed to open {}", db_path.display()))?;
+    let thread_visibility_filter = log_thread_visibility_filter_sql(&conn).unwrap_or_default();
     let sql = format!(
         "SELECT ts, level, target, thread_id, coalesce(feedback_log_body, '') \
          FROM logs WHERE ts >= ?1 AND ({where_clause}) \
+         {thread_visibility_filter} \
          ORDER BY ts DESC, ts_nanos DESC, id DESC LIMIT 1"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -337,6 +435,34 @@ pub fn latest_log_like(where_clause: &str) -> Result<Option<LogEvent>> {
     } else {
         Ok(None)
     }
+}
+
+fn log_thread_visibility_filter_sql(conn: &Connection) -> Result<String> {
+    let state_db = state_db_path();
+    if !state_db.exists() {
+        return Ok(String::new());
+    }
+    let state_db = state_db.display().to_string();
+    conn.execute("ATTACH DATABASE ?1 AS state", [&state_db])
+        .with_context(|| format!("failed to attach {state_db} for log filtering"))?;
+    let columns = table_columns(conn, "PRAGMA state.table_info(threads)")?;
+    let mut internal_clauses = Vec::new();
+    if columns.contains("thread_source") {
+        internal_clauses.push("coalesce(state.threads.thread_source, '') = 'subagent'");
+    }
+    if columns.contains("source") {
+        internal_clauses.push("coalesce(state.threads.source, '') LIKE '%\"subagent\"%'");
+    }
+    if internal_clauses.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        "AND (thread_id IS NULL OR thread_id = '' OR NOT EXISTS (\
+         SELECT 1 FROM state.threads \
+         WHERE state.threads.id = thread_id \
+           AND ({})))",
+        internal_clauses.join(" OR ")
+    ))
 }
 
 pub fn latest_recovery_log_for_hook(
@@ -842,10 +968,13 @@ fn latest_running_log_activity_for_thread_from_db(
 }
 
 pub fn latest_thread_feedback(thread_id: &str) -> Result<ThreadFeedback> {
-    let thread = read_recent_threads(50)?
-        .into_iter()
-        .find(|thread| thread.id == thread_id)
-        .ok_or_else(|| anyhow!("thread not found: {thread_id}"))?;
+    let db_path = state_db_path();
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", db_path.display()))?;
+    let thread = read_user_visible_thread(&conn, thread_id)?;
     latest_thread_feedback_for(&thread)
 }
 
@@ -857,6 +986,7 @@ pub fn latest_thread_feedback_for(thread: &ThreadSummary) -> Result<ThreadFeedba
             title: thread.title.clone(),
             timestamp,
             text,
+            internal_thread: false,
         });
     }
 
@@ -865,6 +995,7 @@ pub fn latest_thread_feedback_for(thread: &ThreadSummary) -> Result<ThreadFeedba
         title: thread.title.clone(),
         timestamp: None,
         text: "没有读取到 assistant 最后反馈。".to_string(),
+        internal_thread: false,
     })
 }
 
@@ -1731,7 +1862,7 @@ fn normalize_prompt(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rusqlite::Connection;
@@ -1794,11 +1925,11 @@ mod tests {
         _lock: MutexGuard<'static, ()>,
     }
 
-    static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
-
     impl HomeEnvGuard {
         fn set(home: &Path) -> Self {
-            let lock = HOME_ENV_LOCK.lock().expect("HOME env lock poisoned");
+            let lock = crate::TEST_HOME_ENV_LOCK
+                .lock()
+                .expect("HOME env lock poisoned");
             let previous = std::env::var_os("HOME");
             unsafe {
                 std::env::set_var("HOME", home);
@@ -1876,6 +2007,132 @@ mod tests {
             .query_row("SELECT count(*) FROM threads", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recent_threads_hide_subagent_threads() {
+        let root = temp_db_path("recent-thread-subagent-root");
+        let _ = fs::remove_file(&root);
+        fs::create_dir_all(&root).unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let _home = HomeEnvGuard::set(&home);
+
+        let db = home.join(".codex").join("state_5.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                rollout_path TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'vscode',
+                thread_source TEXT,
+                agent_nickname TEXT,
+                agent_role TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, title, cwd, updated_at, rollout_path, source, thread_source)
+             VALUES ('normal-thread', '用户线程', '/tmp', 100, '/tmp/normal.jsonl', 'vscode', 'user')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, title, cwd, updated_at, rollout_path, source, thread_source, agent_nickname, agent_role)
+             VALUES ('child-thread', 'Inspect child', '/tmp', 200, '/tmp/child.jsonl', '{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"normal-thread\"}}}', 'subagent', 'Archimedes', 'explorer')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, title, cwd, updated_at, rollout_path, source, thread_source)
+             VALUES ('legacy-child-thread', 'Memory child', '/tmp', 150, '/tmp/legacy-child.jsonl', '{\"subagent\":\"memory_consolidation\"}', NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let threads = read_recent_threads(10).unwrap();
+
+        assert_eq!(
+            threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["normal-thread"]
+        );
+        assert!(!is_internal_thread("normal-thread").unwrap());
+        assert!(is_internal_thread("child-thread").unwrap());
+        assert!(is_internal_thread("legacy-child-thread").unwrap());
+        assert!(latest_thread_feedback("child-thread").is_err());
+        assert!(latest_thread_feedback("legacy-child-thread").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_log_summary_skips_subagent_threads() {
+        let root = temp_db_path("status-log-subagent-root");
+        let _ = fs::remove_file(&root);
+        fs::create_dir_all(&root).unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let _home = HomeEnvGuard::set(&home);
+
+        let state_db = home.join(".codex").join("state_5.sqlite");
+        let state = Connection::open(&state_db).unwrap();
+        state
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    source TEXT NOT NULL DEFAULT 'vscode',
+                    thread_source TEXT
+                );",
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO threads (id, source, thread_source)
+                 VALUES ('visible-thread', 'vscode', 'user')",
+                [],
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO threads (id, source, thread_source)
+                 VALUES ('child-thread', '{\"subagent\":{\"thread_spawn\":{}}}', 'subagent')",
+                [],
+            )
+            .unwrap();
+        drop(state);
+
+        let logs_db = home.join(".codex").join("logs_2.sqlite");
+        let logs = Connection::open(&logs_db).unwrap();
+        create_logs_table(&logs);
+        let now = Utc::now().timestamp();
+        logs.execute(
+            "INSERT INTO logs (id, ts, ts_nanos, level, target, thread_id, feedback_log_body)
+             VALUES (1, ?1, 0, 'WARN', 'codex_core::session::turn', 'visible-thread', 'stream disconnected visible')",
+            [now - 10],
+        )
+        .unwrap();
+        logs.execute(
+            "INSERT INTO logs (id, ts, ts_nanos, level, target, thread_id, feedback_log_body)
+             VALUES (2, ?1, 0, 'WARN', 'codex_core::session::turn', 'child-thread', 'stream disconnected child')",
+            [now],
+        )
+        .unwrap();
+        drop(logs);
+
+        let event = latest_log_like("feedback_log_body LIKE '%stream disconnected%'")
+            .unwrap()
+            .expect("visible log remains");
+
+        assert_eq!(event.thread_id.as_deref(), Some("visible-thread"));
+        assert_eq!(event.body, "stream disconnected visible");
         let _ = fs::remove_dir_all(root);
     }
 

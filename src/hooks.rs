@@ -110,6 +110,8 @@ struct HookFeedbackSnapshot {
     title: String,
     timestamp: Option<String>,
     text: String,
+    #[serde(default)]
+    internal_thread: bool,
 }
 
 pub fn codex_config_path() -> PathBuf {
@@ -214,26 +216,39 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
     let cfg = config::load_or_create().unwrap_or_default();
     let collect_latest_feedback = should_collect_latest_feedback(&cfg);
     let classification = classify_stop_input_with_feedback(&input, collect_latest_feedback);
+    let internal_thread = hook_input_is_internal_thread(&input);
     let body_hash = stable_hash_hex(&[&classification.body]);
     let event_key = stop_event_key(&input, &classification, &body_hash);
     let duplicate = recent_key_seen(&event_key, STOP_HOOK_DEDUP_WINDOW_SECONDS).unwrap_or(false);
-    let queued_recovery = stop_hook_recovery_request(&input, &cfg, &classification, duplicate);
-    let response = stop_hook_response(
-        &input,
-        &cfg,
-        &classification.decision,
-        should_sleep_in_hook(),
-        duplicate,
-        queued_recovery.is_some(),
-    )?;
-    let action = stop_hook_action(&input, &cfg, &classification, duplicate);
+    let queued_recovery = if internal_thread {
+        None
+    } else {
+        stop_hook_recovery_request(&input, &cfg, &classification, duplicate)
+    };
+    let response = if internal_thread {
+        json!({ "continue": true })
+    } else {
+        stop_hook_response(
+            &input,
+            &cfg,
+            &classification.decision,
+            should_sleep_in_hook(),
+            duplicate,
+            queued_recovery.is_some(),
+        )?
+    };
+    let action = if internal_thread {
+        "none"
+    } else {
+        stop_hook_action(&input, &cfg, &classification, duplicate)
+    };
     let completion_duplicate = if action == "completed" {
         recent_key_seen(&event_key, STOP_HOOK_COMPLETION_DEDUP_WINDOW_SECONDS).unwrap_or(false)
     } else {
         false
     };
 
-    if should_log_stop_event(&cfg, &classification, action) {
+    if !internal_thread && should_log_stop_event(&cfg, &classification, action) {
         if let Err(err) = log_stop_hook_event(
             &cfg,
             &input,
@@ -245,7 +260,7 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
             tracing::warn!("failed to write Stop hook event: {err:#}");
         }
     }
-    if should_write_cooldown_key(&classification, action) {
+    if !internal_thread && should_write_cooldown_key(&classification, action) {
         if let Err(err) = append_hook_cooldown_key(&cfg, &event_key) {
             tracing::warn!("failed to write Stop hook cooldown key: {err:#}");
         }
@@ -474,7 +489,18 @@ fn latest_feedback_snapshot(input: &HookInput) -> Option<HookFeedbackSnapshot> {
         title: feedback.title,
         timestamp: feedback.timestamp,
         text: truncate(&feedback.text, 1200),
+        internal_thread: feedback.internal_thread,
     })
+}
+
+fn hook_input_is_internal_thread(input: &HookInput) -> bool {
+    input
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+        .and_then(|thread_id| codex::is_internal_thread(thread_id).ok())
+        .unwrap_or(false)
 }
 
 fn stop_log_lookback_seconds(input: &HookInput) -> i64 {
@@ -868,7 +894,10 @@ fn stop_hook_action(
 
 fn is_normal_completion(classification: &StopClassification) -> bool {
     classification.decision.kind == RecoveryKind::None
-        && classification.latest_feedback.is_some()
+        && classification
+            .latest_feedback
+            .as_ref()
+            .is_some_and(|feedback| !feedback.internal_thread)
         && !classification.body.trim().is_empty()
         && matches!(
             classification.source.as_str(),
@@ -1073,7 +1102,11 @@ fn read_completion_notification() -> Result<CompletionNotification> {
 }
 
 fn should_notify_completion(cfg: &AppConfig, notification: &CompletionNotification) -> bool {
-    cfg.observability.completion_notifications_enabled && notification.latest_feedback.is_some()
+    cfg.observability.completion_notifications_enabled
+        && notification
+            .latest_feedback
+            .as_ref()
+            .is_some_and(|feedback| !feedback.internal_thread)
 }
 
 fn format_completion_notification(notification: &CompletionNotification) -> String {
@@ -1168,6 +1201,9 @@ fn recent_hook_events_from_path(path: &Path, limit: usize) -> Result<Vec<HookEve
             if is_stale_completion_event_without_feedback(&event) {
                 continue;
             }
+            if hook_event_is_internal_thread(&event) {
+                continue;
+            }
             events.push(event);
         }
     }
@@ -1182,6 +1218,31 @@ fn recent_hook_events_from_path(path: &Path, limit: usize) -> Result<Vec<HookEve
 
 fn is_stale_completion_event_without_feedback(event: &HookEventLine) -> bool {
     event.action == "completed" && event.latest_feedback.is_none()
+}
+
+fn hook_event_is_internal_thread(event: &HookEventLine) -> bool {
+    if event
+        .latest_feedback
+        .as_ref()
+        .and_then(|feedback| feedback.get("internal_thread"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let thread_id = event
+        .latest_feedback
+        .as_ref()
+        .and_then(|feedback| feedback.get("thread_id"))
+        .and_then(Value::as_str)
+        .or(event.session_id.as_deref())
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty());
+
+    thread_id
+        .and_then(|thread_id| codex::is_internal_thread(thread_id).ok())
+        .unwrap_or(false)
 }
 
 fn recent_key_seen(key: &str, max_age_seconds: i64) -> Result<bool> {
@@ -1316,8 +1377,53 @@ fn truncate(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::MutexGuard;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
     use chrono::TimeZone;
+    use rusqlite::Connection;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("codex-sentinel-{name}-{nanos}"))
+    }
+
+    struct HomeEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl HomeEnvGuard {
+        fn set(home: &Path) -> Self {
+            let lock = crate::TEST_HOME_ENV_LOCK
+                .lock()
+                .expect("HOME env lock poisoned");
+            let previous = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var("HOME", previous);
+                } else {
+                    std::env::remove_var("HOME");
+                }
+            }
+        }
+    }
 
     fn test_feedback_snapshot(thread_id: &str) -> HookFeedbackSnapshot {
         HookFeedbackSnapshot {
@@ -1325,6 +1431,7 @@ mod tests {
             title: "测试线程".to_string(),
             timestamp: Some("2026-05-14T01:27:03Z".to_string()),
             text: "最终结果在这里。".to_string(),
+            internal_thread: false,
         }
     }
 
@@ -1485,6 +1592,39 @@ mod tests {
         };
 
         assert!(!should_notify_completion(&cfg, &notification));
+    }
+
+    #[test]
+    fn completion_notification_for_subagent_thread_is_suppressed() {
+        let notification = CompletionNotification {
+            event: Some("Stop".to_string()),
+            session_id: Some("child-thread".to_string()),
+            turn_id: Some("turn-a".to_string()),
+            cwd: Some("/Users/gosu/Documents".to_string()),
+            model: Some("gpt".to_string()),
+            source: "last_assistant_message".to_string(),
+            body: "子代理已经完成。".to_string(),
+            latest_feedback: Some(HookFeedbackSnapshot {
+                thread_id: "child-thread".to_string(),
+                title: "Inspect child".to_string(),
+                timestamp: Some("2026-05-14T01:27:03Z".to_string()),
+                text: "子代理最终反馈。".to_string(),
+                internal_thread: true,
+            }),
+        };
+
+        assert!(!should_notify_completion(
+            &AppConfig::default(),
+            &notification
+        ));
+
+        let classification = StopClassification {
+            decision: RecoveryDecision::none(),
+            source: "last_assistant_message".to_string(),
+            body: "子代理已经完成。".to_string(),
+            latest_feedback: notification.latest_feedback.clone(),
+        };
+        assert!(!is_normal_completion(&classification));
     }
 
     #[test]
@@ -1994,6 +2134,95 @@ mod tests {
         assert_eq!(events[0].session_id.as_deref(), Some("visible-thread"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recent_hook_events_hide_subagent_thread_events() {
+        let root = temp_path("hook-events-subagent-root");
+        fs::create_dir_all(&root).unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let _home = HomeEnvGuard::set(&home);
+
+        let state_db = home.join(".codex").join("state_5.sqlite");
+        let state = Connection::open(&state_db).unwrap();
+        state
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    source TEXT NOT NULL DEFAULT 'vscode',
+                    thread_source TEXT
+                );",
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO threads (id, source, thread_source)
+                 VALUES ('visible-thread', 'vscode', 'user')",
+                [],
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO threads (id, source, thread_source)
+                 VALUES ('child-thread', '{\"subagent\":{\"thread_spawn\":{}}}', 'subagent')",
+                [],
+            )
+            .unwrap();
+        drop(state);
+
+        let path = root.join("hook-events.jsonl");
+        let ts = Utc.with_ymd_and_hms(2026, 5, 12, 1, 0, 0).unwrap();
+        let decision = RecoveryDecision::none();
+        let visible = json!({
+            "ts": ts,
+            "event": "Stop",
+            "action": "completed",
+            "event_key": "visible-thread:turn:None:hash",
+            "source": "last_assistant_message",
+            "session_id": "visible-thread",
+            "turn_id": "turn",
+            "decision": decision,
+            "body": "visible done",
+            "latest_feedback": {
+                "thread_id": "visible-thread",
+                "title": "可见线程",
+                "timestamp": null,
+                "text": "任务完成"
+            }
+        });
+        let child = json!({
+            "ts": ts + chrono::Duration::seconds(1),
+            "event": "Stop",
+            "action": "completed",
+            "event_key": "child-thread:turn:None:hash",
+            "source": "last_assistant_message",
+            "session_id": "child-thread",
+            "turn_id": "turn",
+            "decision": decision,
+            "body": "child done",
+            "latest_feedback": {
+                "thread_id": "child-thread",
+                "title": "Inspect child",
+                "timestamp": null,
+                "text": "子代理完成"
+            }
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&visible).unwrap(),
+                serde_json::to_string(&child).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let events = recent_hook_events_from_path(&path, 8).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some("visible-thread"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

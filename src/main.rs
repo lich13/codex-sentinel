@@ -12,6 +12,9 @@ mod ui;
 
 use anyhow::Result;
 
+#[cfg(test)]
+pub(crate) static TEST_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
