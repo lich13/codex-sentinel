@@ -1194,7 +1194,7 @@ fn max_recoveries_for(decision: &RecoveryDecision) -> u32 {
         RecoveryKind::RetryLater => 10,
         RecoveryKind::RetrySoon => 8,
         RecoveryKind::ToolRetryWithDifferentPath => 5,
-        RecoveryKind::SafetyRephrase => 3,
+        RecoveryKind::SafetyBlocked => 3,
         RecoveryKind::ManualOnly | RecoveryKind::SwitchModel => 3,
         RecoveryKind::None | RecoveryKind::Reauth => 0,
     }
@@ -1203,14 +1203,9 @@ fn max_recoveries_for(decision: &RecoveryDecision) -> u32 {
 fn recovery_prompt(cfg: &AppConfig, decision: &RecoveryDecision) -> String {
     let prompt = match decision.kind {
         RecoveryKind::ToolRetryWithDifferentPath => &cfg.recovery.tool_failure_prompt,
-        RecoveryKind::SafetyRephrase => &cfg.recovery.safety_rephrase_prompt,
         _ => &cfg.recovery.continue_prompt,
     };
-    if decision.kind == RecoveryKind::SafetyRephrase {
-        sanitized_recovery_text(prompt)
-    } else {
-        prompt.to_string()
-    }
+    sanitized_recovery_text(prompt)
 }
 
 async fn notify_configured_chats(

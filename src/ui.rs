@@ -11,7 +11,7 @@ use tauri::menu::{CheckMenuItem, MenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{Manager, WindowEvent};
 
-use crate::{codex, config, control_queue, desktop_control, hooks, maintenance};
+use crate::{codex, config, control_queue, desktop_control, hooks, lifecycle, maintenance};
 
 const TRAY_ID: &str = "main";
 const TRAY_MENU_SHOW: &str = "tray-show";
@@ -49,7 +49,6 @@ struct ConfigSummary {
     cooldown_seconds: u64,
     continue_prompt: String,
     tool_failure_prompt: String,
-    safety_rephrase_prompt: String,
     latest_feedback_enabled: bool,
     completion_notifications_enabled: bool,
     record_normal_completion_events: bool,
@@ -74,7 +73,6 @@ struct RuntimeSettingsInput {
     cooldown_seconds: u64,
     continue_prompt: String,
     tool_failure_prompt: String,
-    safety_rephrase_prompt: String,
     latest_feedback_enabled: bool,
     completion_notifications_enabled: bool,
     record_normal_completion_events: bool,
@@ -194,7 +192,7 @@ pub fn run_gui() -> Result<()> {
                     tracing::warn!("failed to toggle auto recover from tray: {err:#}");
                 }
             }
-            TRAY_MENU_QUIT => app.exit(0),
+            TRAY_MENU_QUIT => quit_app(app),
             _ => {}
         })
         .on_window_event(|window, event| {
@@ -229,6 +227,13 @@ pub fn run_gui() -> Result<()> {
         .run(tauri::generate_context!())
         .map_err(|err| anyhow!("failed to run Tauri app: {err}"))?;
     Ok(())
+}
+
+fn quit_app(app: &tauri::AppHandle) {
+    if let Err(err) = lifecycle::shutdown_followed_processes() {
+        tracing::warn!("failed to stop Sentinel background processes before quit: {err:#}");
+    }
+    app.exit(0);
 }
 
 fn install_tray_menu(app: &tauri::App) -> Result<()> {
@@ -442,7 +447,6 @@ fn save_runtime_settings(
     cfg.recovery.auto_recover = input.auto_recover;
     cfg.recovery.continue_prompt = input.continue_prompt.trim().to_string();
     cfg.recovery.tool_failure_prompt = input.tool_failure_prompt.trim().to_string();
-    cfg.recovery.safety_rephrase_prompt = input.safety_rephrase_prompt.trim().to_string();
     cfg.observability.latest_feedback_enabled = input.latest_feedback_enabled;
     cfg.observability.completion_notifications_enabled = input.completion_notifications_enabled;
     cfg.observability.record_normal_completion_events = input.record_normal_completion_events;
@@ -741,7 +745,6 @@ fn summarize_config(cfg: &config::AppConfig) -> ConfigSummary {
         cooldown_seconds: cfg.watch.cooldown_seconds,
         continue_prompt: cfg.recovery.continue_prompt.clone(),
         tool_failure_prompt: cfg.recovery.tool_failure_prompt.clone(),
-        safety_rephrase_prompt: cfg.recovery.safety_rephrase_prompt.clone(),
         latest_feedback_enabled: cfg.observability.latest_feedback_enabled,
         completion_notifications_enabled: cfg.observability.completion_notifications_enabled,
         record_normal_completion_events: cfg.observability.record_normal_completion_events,

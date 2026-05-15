@@ -97,11 +97,6 @@ const AX_ERROR_SUCCESS: i32 = 0;
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
-    fn CGEventKeyboardSetUnicodeString(
-        event: CGEventRef,
-        string_length: libc::size_t,
-        unicode_string: *const u16,
-    );
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1317,8 +1312,8 @@ fn post_control_key_press(pid: i32, keycode: u16) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn insert_prompt_text(pid: i32, prompt: &str, attempt: usize) -> Result<()> {
+    let _ = attempt;
     match text_input_method(attempt) {
-        TextInputMethod::Unicode => type_unicode_text(pid, prompt)?,
         TextInputMethod::ClipboardPaste => {
             write_clipboard(prompt.as_bytes())?;
             std::thread::sleep(PASTEBOARD_SETTLE);
@@ -1331,34 +1326,13 @@ fn insert_prompt_text(pid: i32, prompt: &str, attempt: usize) -> Result<()> {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextInputMethod {
-    Unicode,
     ClipboardPaste,
 }
 
 #[cfg(target_os = "macos")]
 fn text_input_method(attempt: usize) -> TextInputMethod {
-    match attempt % 4 {
-        0 | 2 => TextInputMethod::ClipboardPaste,
-        1 => TextInputMethod::Unicode,
-        _ => TextInputMethod::Unicode,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn type_unicode_text(pid: i32, text: &str) -> Result<()> {
-    for chunk in text.encode_utf16().collect::<Vec<_>>().chunks(64) {
-        let source = event_source()?;
-        for keydown in [true, false] {
-            let event = CGEvent::new_keyboard_event(source.clone(), 0, keydown)
-                .map_err(|_| anyhow!("failed to create unicode keyboard event"))?;
-            unsafe {
-                CGEventKeyboardSetUnicodeString(event.as_ptr(), chunk.len(), chunk.as_ptr());
-            }
-            event.post_to_pid(pid);
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-    Ok(())
+    let _ = attempt;
+    TextInputMethod::ClipboardPaste
 }
 
 fn post_key_press(pid: i32, keycode: u16, flags: CGEventFlags) -> Result<()> {
@@ -1451,11 +1425,11 @@ mod tests {
     }
 
     #[test]
-    fn visible_submit_prefers_clipboard_before_unicode_fallback() {
+    fn visible_submit_uses_clipboard_only_to_avoid_unicode_single_character_pollution() {
         assert_eq!(text_input_method(0), TextInputMethod::ClipboardPaste);
-        assert_eq!(text_input_method(1), TextInputMethod::Unicode);
+        assert_eq!(text_input_method(1), TextInputMethod::ClipboardPaste);
         assert_eq!(text_input_method(2), TextInputMethod::ClipboardPaste);
-        assert_eq!(text_input_method(3), TextInputMethod::Unicode);
+        assert_eq!(text_input_method(3), TextInputMethod::ClipboardPaste);
     }
 
     #[test]

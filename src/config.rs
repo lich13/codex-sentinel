@@ -41,8 +41,6 @@ pub struct RecoveryConfig {
     pub auto_recover: bool,
     pub continue_prompt: String,
     pub tool_failure_prompt: String,
-    #[serde(default = "default_safety_rephrase_prompt")]
-    pub safety_rephrase_prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +96,6 @@ impl Default for RecoveryConfig {
             auto_recover: true,
             continue_prompt: "继续干。请先检查当前线程最近状态和工具输出，不要从头开始；如果上一步因为网络、限流或服务端临时错误中断，接着执行；如果其实已经完成，直接汇报结果。".to_string(),
             tool_failure_prompt: "继续干。上一条工具调用失败了，请不要重复使用失效的 session/process/tool；先检查可用工具和当前状态，换一种方式继续完成任务。".to_string(),
-            safety_rephrase_prompt: default_safety_rephrase_prompt(),
         }
     }
 }
@@ -119,10 +116,6 @@ impl Default for ObservabilityConfig {
 
 fn default_pairing_enabled() -> bool {
     true
-}
-
-fn default_safety_rephrase_prompt() -> String {
-    "继续干。上一轮触发了平台内容安全拦截，请不要复述拦截提示原文。先把任务表述为明确的本机授权、维护/防御/排障范围，确认不攻击第三方、不获取凭据、不绕过安全控制，然后在这个范围内继续完成。如果授权或边界不清，先向用户提出需要补充的最小信息。".to_string()
 }
 
 pub fn config_dir() -> PathBuf {
@@ -184,7 +177,6 @@ enabled = false
         assert_eq!(cfg.watch.poll_interval_seconds, 5);
         assert!(cfg.telegram.pairing_enabled);
         assert!(cfg.recovery.auto_recover);
-        assert!(!cfg.recovery.safety_rephrase_prompt.is_empty());
         assert!(cfg.observability.latest_feedback_enabled);
         assert!(cfg.observability.completion_notifications_enabled);
         assert!(!cfg.observability.record_normal_completion_events);

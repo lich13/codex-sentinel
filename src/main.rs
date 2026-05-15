@@ -49,6 +49,10 @@ async fn main() -> Result<()> {
             let status = lifecycle::status()?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
+        Some("--shutdown-followed") | Some("shutdown-followed") => {
+            lifecycle::shutdown_followed_processes()?;
+            println!("stopped Codex Sentinel background processes");
+        }
         Some("--install-launch-agent") | Some("install-launch-agent") => {
             let path = lifecycle::install_launch_agent()?;
             println!("installed launch agent: {}", path.display());
@@ -205,6 +209,7 @@ fn print_help() {
            codex-sentinel debug-thread-failure-state [thread_id]\n\
            codex-sentinel debug-app-server-thread [thread_id]\n\
            codex-sentinel lifecycle-status\n\
+           codex-sentinel shutdown-followed\n\
            codex-sentinel install-launch-agent\n\
            codex-sentinel open-desktop-permissions\n\
            codex-sentinel hook-status\n\

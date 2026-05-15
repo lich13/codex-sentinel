@@ -9,7 +9,7 @@ pub enum RecoveryKind {
     Reauth,
     SwitchModel,
     ToolRetryWithDifferentPath,
-    SafetyRephrase,
+    SafetyBlocked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,10 +88,10 @@ pub fn classify_error(text: &str) -> RecoveryDecision {
         || lower.contains("trusted access for cyber")
     {
         return RecoveryDecision {
-            kind: RecoveryKind::SafetyRephrase,
+            kind: RecoveryKind::SafetyBlocked,
             auto_allowed: true,
             delay_seconds: 0,
-            label: "内容安全改写".to_string(),
+            label: "内容安全拦截".to_string(),
             reason: "上一轮请求表述触发平台安全规则；需要明确本机授权、维护/防御/排障范围后继续。"
                 .to_string(),
         };
@@ -335,7 +335,7 @@ mod tests {
         let flagged = classify_error(
             "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program.",
         );
-        assert_eq!(flagged.kind, RecoveryKind::SafetyRephrase);
+        assert_eq!(flagged.kind, RecoveryKind::SafetyBlocked);
         assert!(flagged.auto_allowed);
         assert!(!flagged.label.contains("Cyber"));
         assert!(
@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitizes_safety_rephrase_prompt_text() {
+    fn sanitizes_safety_blocked_prompt_text() {
         let text = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. Trusted Access for Cyber: https://chatgpt.com/cyber";
         let sanitized = sanitized_recovery_text(text);
         let lower = sanitized.to_ascii_lowercase();

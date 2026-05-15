@@ -894,6 +894,36 @@ pub fn latest_assistant_text_from_rollout_path(
     Ok(None)
 }
 
+fn latest_user_message_from_rollout_path(
+    path: impl AsRef<Path>,
+    since_ts: i64,
+) -> Result<Option<(Option<String>, String)>> {
+    let path = path.as_ref();
+    let lines = read_tail_lines(path, ROLLOUT_FEEDBACK_SCAN_BYTES)?;
+    for line in lines.iter().rev() {
+        if line.len() > ROLLOUT_MAX_PARSE_LINE_BYTES {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let ts = rollout_event_ts(&value).unwrap_or(0);
+        if ts < since_ts {
+            continue;
+        }
+        if let Some(text) = user_message_text(&value) {
+            return Ok(Some((
+                value
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                text,
+            )));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 fn latest_recovery_event_from_rollout_path(
     path: impl AsRef<Path>,
@@ -939,7 +969,10 @@ fn scan_rollout_recovery(
             }
         }
 
-        if is_agent_or_assistant_message(&value) || is_successful_task_complete(&value) {
+        if is_user_message(&value)
+            || is_agent_or_assistant_message(&value)
+            || is_successful_task_complete(&value)
+        {
             return Ok(RolloutRecoveryScan {
                 recovery: None,
                 normal_progress_ts: Some(ts),
@@ -1003,6 +1036,21 @@ fn rollout_recovery_text(thread_id: &str, value: &Value) -> Option<String> {
     }
 
     None
+}
+
+fn is_user_message(value: &Value) -> bool {
+    let Some(payload) = value.get("payload") else {
+        return false;
+    };
+    if value.get("type").and_then(Value::as_str) == Some("response_item")
+        && payload.get("type").and_then(Value::as_str) == Some("message")
+        && payload.get("role").and_then(Value::as_str) == Some("user")
+    {
+        return true;
+    }
+
+    value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && payload.get("type").and_then(Value::as_str) == Some("user_message")
 }
 
 fn is_agent_or_assistant_message(value: &Value) -> bool {
@@ -1094,6 +1142,38 @@ fn assistant_message_text(value: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|text| !text.is_empty())
+            .map(str::to_string);
+    }
+
+    None
+}
+
+fn user_message_text(value: &Value) -> Option<String> {
+    let payload = value.get("payload")?;
+    if value.get("type").and_then(Value::as_str) == Some("response_item")
+        && payload.get("type").and_then(Value::as_str) == Some("message")
+        && payload.get("role").and_then(Value::as_str) == Some("user")
+    {
+        let parts = payload
+            .get("content")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>();
+        if !parts.is_empty() {
+            return Some(parts.join("\n\n"));
+        }
+    }
+
+    if value.get("type").and_then(Value::as_str) == Some("event_msg")
+        && payload.get("type").and_then(Value::as_str) == Some("user_message")
+    {
+        return payload
+            .get("message")
+            .or_else(|| payload.get("text"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
             .map(str::to_string);
     }
 
@@ -1388,6 +1468,7 @@ pub fn continue_thread(thread_id: &str, prompt: &str) -> Result<String> {
             submit_baseline.updated_at_ms,
             submit_baseline_probe.as_ref(),
             attempt_started_at,
+            prompt,
             VISIBLE_SUBMIT_WAIT,
         )? {
             tracing::info!(
@@ -1416,6 +1497,7 @@ fn wait_for_thread_submission(
     baseline_updated_at_ms: i64,
     baseline_probe: Option<&ThreadProbe>,
     attempt_started_at: i64,
+    prompt: &str,
     timeout: Duration,
 ) -> Result<bool> {
     let fast_deadline = Instant::now() + VISIBLE_SUBMIT_FAST_PROBE_WAIT.min(timeout);
@@ -1425,18 +1507,22 @@ fn wait_for_thread_submission(
             .flatten();
         if probe.as_ref().is_some_and(|probe| {
             thread_probe_confirms_submission(probe, baseline_probe, attempt_started_at)
-        }) {
+        }) && thread_latest_user_prompt_matches(thread_id, prompt, attempt_started_at)?
+        {
             return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(180));
     }
 
-    if wait_for_thread_update(
-        thread_id,
-        baseline_updated_at_ms,
-        VISIBLE_SUBMIT_DB_WAIT.min(timeout),
-    )? {
-        return Ok(true);
+    let db_deadline = Instant::now() + VISIBLE_SUBMIT_DB_WAIT.min(timeout);
+    while Instant::now() < db_deadline {
+        let current = read_thread_submit_marker(thread_id)?;
+        if current.updated_at_ms > baseline_updated_at_ms
+            && submit_marker_latest_user_prompt_matches(&current, prompt, attempt_started_at)
+        {
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(240));
     }
 
     let probe = app_server_probe::read_thread_probe(thread_id)
@@ -1444,7 +1530,7 @@ fn wait_for_thread_submission(
         .flatten();
     Ok(probe.as_ref().is_some_and(|probe| {
         thread_probe_confirms_submission(probe, baseline_probe, attempt_started_at)
-    }))
+    }) && thread_latest_user_prompt_matches(thread_id, prompt, attempt_started_at)?)
 }
 
 pub fn start_new_thread(
@@ -1499,22 +1585,6 @@ fn wait_for_new_thread_match(
     Ok(None)
 }
 
-fn wait_for_thread_update(
-    thread_id: &str,
-    baseline_updated_at_ms: i64,
-    timeout: Duration,
-) -> Result<bool> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let current = read_thread_submit_marker(thread_id)?;
-        if current.updated_at_ms > baseline_updated_at_ms {
-            return Ok(true);
-        }
-        std::thread::sleep(Duration::from_millis(240));
-    }
-    Ok(false)
-}
-
 fn thread_probe_confirms_submission(
     probe: &ThreadProbe,
     baseline: Option<&ThreadProbe>,
@@ -1545,6 +1615,7 @@ fn thread_probe_confirms_submission(
 #[derive(Debug, Clone)]
 struct ThreadSubmitMarker {
     updated_at_ms: i64,
+    rollout_path: String,
 }
 
 fn read_thread_submit_marker(thread_id: &str) -> Result<ThreadSubmitMarker> {
@@ -1556,11 +1627,13 @@ fn read_thread_submit_marker(thread_id: &str) -> Result<ThreadSubmitMarker> {
     .with_context(|| format!("failed to open {}", db_path.display()))?;
     conn.query_row(
         "SELECT coalesce(updated_at_ms, updated_at * 1000) \
+                , rollout_path \
          FROM threads WHERE id = ?1",
         [thread_id],
         |row| {
             Ok(ThreadSubmitMarker {
                 updated_at_ms: row.get::<_, i64>(0)?,
+                rollout_path: row.get(1)?,
             })
         },
     )
@@ -1594,6 +1667,62 @@ fn prompts_match(stored: &str, prompt: &str) -> bool {
     normalize_prompt(stored) == normalize_prompt(prompt)
 }
 
+fn thread_latest_user_prompt_matches(
+    thread_id: &str,
+    prompt: &str,
+    attempt_started_at: i64,
+) -> Result<bool> {
+    let marker = read_thread_submit_marker(thread_id)?;
+    Ok(submit_marker_latest_user_prompt_matches(
+        &marker,
+        prompt,
+        attempt_started_at,
+    ))
+}
+
+fn submit_marker_latest_user_prompt_matches(
+    marker: &ThreadSubmitMarker,
+    prompt: &str,
+    attempt_started_at: i64,
+) -> bool {
+    let since_ts = attempt_started_at.saturating_sub(VISIBLE_SUBMIT_PROBE_GRACE_SECONDS);
+    let latest = match latest_user_message_from_rollout_path(&marker.rollout_path, since_ts) {
+        Ok(latest) => latest,
+        Err(err) => {
+            tracing::debug!(
+                rollout_path = %marker.rollout_path,
+                "visible continue prompt verification skipped while rollout is unreadable: {err:#}"
+            );
+            return false;
+        }
+    };
+    let Some((_, actual)) = latest else {
+        return false;
+    };
+    let matches = submitted_prompts_match(&actual, prompt);
+    if !matches {
+        tracing::warn!(
+            actual_preview = %prompt_preview(&actual),
+            expected_preview = %prompt_preview(prompt),
+            "visible continue submission prompt mismatch"
+        );
+    }
+    matches
+}
+
+fn submitted_prompts_match(actual: &str, prompt: &str) -> bool {
+    strip_trailing_line_breaks(actual) == strip_trailing_line_breaks(prompt)
+}
+
+fn strip_trailing_line_breaks(value: &str) -> &str {
+    value.trim_end_matches(['\n', '\r'])
+}
+
+fn prompt_preview(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(80).collect()
+}
+
 fn normalize_prompt(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1601,6 +1730,7 @@ fn normalize_prompt(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use rusqlite::Connection;
@@ -1660,15 +1790,22 @@ mod tests {
 
     struct HomeEnvGuard {
         previous: Option<std::ffi::OsString>,
+        _lock: MutexGuard<'static, ()>,
     }
+
+    static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     impl HomeEnvGuard {
         fn set(home: &Path) -> Self {
+            let lock = HOME_ENV_LOCK.lock().expect("HOME env lock poisoned");
             let previous = std::env::var_os("HOME");
             unsafe {
                 std::env::set_var("HOME", home);
             }
-            Self { previous }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
 
@@ -2135,6 +2272,124 @@ mod tests {
     }
 
     #[test]
+    fn visible_continue_rejects_thread_update_when_latest_user_prompt_is_polluted() {
+        let root = temp_db_path("visible-continue-polluted-root");
+        let _ = fs::remove_file(&root);
+        fs::create_dir_all(&root).unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let _home = HomeEnvGuard::set(&home);
+
+        let rollout = root.join("rollout.jsonl");
+        let raw = serde_json::to_string(&json!({
+            "timestamp": "2026-05-14T18:08:56.960Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "式\n"}
+                ]
+            }
+        }))
+        .unwrap();
+        fs::write(&rollout, raw).unwrap();
+
+        let db = home.join(".codex").join("state_5.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                updated_at INTEGER NOT NULL,
+                updated_at_ms INTEGER,
+                rollout_path TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, updated_at, updated_at_ms, rollout_path)
+             VALUES ('thread-a', 1778782136, 1778782136960, ?1)",
+            [&rollout.display().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let confirmed = wait_for_thread_submission(
+            "thread-a",
+            1778782076000,
+            None,
+            1778782134,
+            "把5.14 5.15两天的活动都落盘到活动库里，给我补推5.15的日报，以后日报标题格式改为5月15日玩卡薅羊毛活动这种格式",
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert!(!confirmed);
+        let _ = fs::remove_file(rollout);
+        let _ = fs::remove_file(db);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn visible_continue_accepts_thread_update_when_latest_user_prompt_matches() {
+        let root = temp_db_path("visible-continue-match-root");
+        let _ = fs::remove_file(&root);
+        fs::create_dir_all(&root).unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let _home = HomeEnvGuard::set(&home);
+        let prompt = "把5.14 5.15两天的活动都落盘到活动库里，给我补推5.15的日报，以后日报标题格式改为5月15日玩卡薅羊毛活动这种格式";
+
+        let rollout = root.join("rollout.jsonl");
+        let raw = serde_json::to_string(&json!({
+            "timestamp": "2026-05-14T18:08:56.960Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": format!("{prompt}\n")
+            }
+        }))
+        .unwrap();
+        fs::write(&rollout, raw).unwrap();
+
+        let db = home.join(".codex").join("state_5.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                updated_at INTEGER NOT NULL,
+                updated_at_ms INTEGER,
+                rollout_path TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, updated_at, updated_at_ms, rollout_path)
+             VALUES ('thread-a', 1778782136, 1778782136960, ?1)",
+            [&rollout.display().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let confirmed = wait_for_thread_submission(
+            "thread-a",
+            1778782076000,
+            None,
+            1778782134,
+            prompt,
+            Duration::from_millis(120),
+        )
+        .unwrap();
+
+        assert!(confirmed);
+        let _ = fs::remove_file(rollout);
+        let _ = fs::remove_file(db);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rollout_lookup_stops_after_latest_normal_agent_message() {
         let path = temp_db_path("rollout-normal-after-silent").with_extension("jsonl");
         let raw = [
@@ -2457,7 +2712,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_recovery_log_lookup_finds_cyber_safety_rephrase() {
+    fn thread_recovery_log_lookup_finds_cyber_safety_blocked() {
         let db = temp_db_path("thread-recovery-log-safety");
         let conn = Connection::open(&db).expect("create temp db");
         conn.execute_batch(
@@ -2486,7 +2741,7 @@ mod tests {
         assert!(event.body.contains("possible cybersecurity risk"));
         assert_eq!(
             classify_error(&event.body).kind,
-            RecoveryKind::SafetyRephrase
+            RecoveryKind::SafetyBlocked
         );
 
         let _ = fs::remove_file(db);

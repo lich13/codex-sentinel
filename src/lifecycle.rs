@@ -96,6 +96,12 @@ pub fn install_launch_agent() -> Result<PathBuf> {
     Ok(path)
 }
 
+pub fn shutdown_followed_processes() -> Result<()> {
+    unload_launch_agent();
+    let snapshot = inspect_processes()?;
+    stop_followed_processes(&snapshot)
+}
+
 pub fn ensure_control_worker_running_for_queue() -> Result<()> {
     let snapshot = inspect_processes()?;
     if !snapshot.codex_running {
@@ -188,6 +194,7 @@ fn stop_followed_processes(snapshot: &ProcessSnapshot) -> Result<()> {
         .iter()
         .chain(snapshot.daemon_pids.iter())
         .chain(snapshot.control_worker_pids.iter())
+        .chain(snapshot.lifecycle_pids.iter())
         .copied()
     {
         tracing::info!(
@@ -436,6 +443,22 @@ fn reload_launch_agent(path: &Path) -> Result<()> {
             "launchctl kickstart {service} failed with {status}"
         ))
     }
+}
+
+fn unload_launch_agent() {
+    let Ok(uid) = current_uid() else {
+        return;
+    };
+    let domain = format!("gui/{uid}");
+    let path = launch_agent_path();
+    let service = format!("{domain}/{LABEL}");
+    let _ = Command::new("launchctl")
+        .args(["bootout", &domain])
+        .arg(&path)
+        .status();
+    let _ = Command::new("launchctl")
+        .args(["bootout", &service])
+        .status();
 }
 
 fn current_uid() -> Result<String> {

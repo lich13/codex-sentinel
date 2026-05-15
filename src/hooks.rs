@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -557,18 +557,13 @@ fn read_stdin_string() -> Result<String> {
 fn continuation_prompt(cfg: &AppConfig, decision: &RecoveryDecision) -> String {
     let prompt = match decision.kind {
         RecoveryKind::ToolRetryWithDifferentPath => &cfg.recovery.tool_failure_prompt,
-        RecoveryKind::SafetyRephrase => &cfg.recovery.safety_rephrase_prompt,
         _ => &cfg.recovery.continue_prompt,
     };
     let combined = format!(
         "{}\n\nCodex Sentinel 自动恢复原因：{}。{}",
         prompt, decision.label, decision.reason
     );
-    if decision.kind == RecoveryKind::SafetyRephrase {
-        sanitized_recovery_text(&combined)
-    } else {
-        combined
-    }
+    sanitized_recovery_text(&combined)
 }
 
 fn should_sleep_in_hook() -> bool {
@@ -618,14 +613,9 @@ fn stop_hook_recovery_request(
 fn recovery_prompt_for_request(cfg: &AppConfig, decision: &RecoveryDecision) -> String {
     let prompt = match decision.kind {
         RecoveryKind::ToolRetryWithDifferentPath => &cfg.recovery.tool_failure_prompt,
-        RecoveryKind::SafetyRephrase => &cfg.recovery.safety_rephrase_prompt,
         _ => &cfg.recovery.continue_prompt,
     };
-    if decision.kind == RecoveryKind::SafetyRephrase {
-        sanitized_recovery_text(prompt)
-    } else {
-        prompt.to_string()
-    }
+    sanitized_recovery_text(prompt)
 }
 
 fn read_codex_hooks_feature(path: &Path) -> Result<bool> {
@@ -1108,9 +1098,8 @@ fn format_completion_notification(notification: &CompletionNotification) -> Stri
         .latest_feedback
         .as_ref()
         .and_then(|feedback| feedback.timestamp.as_deref())
-        .map(str::trim)
-        .filter(|timestamp| !timestamp.is_empty())
-        .unwrap_or("无时间戳");
+        .map(feedback_timestamp_label)
+        .unwrap_or_else(|| "无时间戳".to_string());
 
     format!(
         "线程正常完成\n{}\n{}\n\n最后反馈时间：{}\n最后反馈：\n{}",
@@ -1119,6 +1108,25 @@ fn format_completion_notification(notification: &CompletionNotification) -> Stri
         feedback_time,
         truncate(feedback_text, 2600)
     )
+}
+
+fn feedback_timestamp_label(timestamp: &str) -> String {
+    let timestamp = timestamp.trim();
+    if timestamp.is_empty() {
+        return "无时间戳".to_string();
+    }
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|parsed| {
+            parsed
+                .with_timezone(&beijing_offset())
+                .format("%Y-%m-%d %H:%M:%S 北京时间")
+                .to_string()
+        })
+        .unwrap_or_else(|_| timestamp.to_string())
+}
+
+fn beijing_offset() -> FixedOffset {
+    FixedOffset::east_opt(8 * 60 * 60).expect("valid Beijing UTC offset")
 }
 
 fn completion_notification_keyboard(notification: &CompletionNotification) -> Option<Value> {
@@ -1428,7 +1436,7 @@ mod tests {
         assert!(text.contains("线程正常完成"));
         assert!(text.contains("测试线程"));
         assert!(text.contains("thread-a"));
-        assert!(text.contains("最后反馈时间：2026-05-14T01:27:03Z"));
+        assert!(text.contains("最后反馈时间：2026-05-14 09:27:03 北京时间"));
         assert!(text.contains("最终结果在这里。"));
 
         let keyboard = completion_notification_keyboard(&notification).unwrap();
@@ -1566,8 +1574,7 @@ mod tests {
 
     #[test]
     fn safety_stop_hook_prompt_does_not_echo_trigger_terms() {
-        let mut cfg = AppConfig::default();
-        cfg.recovery.safety_rephrase_prompt = "继续干。possible cybersecurity risk / try rephrasing your request / Trusted Access for Cyber / https://chatgpt.com/cyber".to_string();
+        let cfg = AppConfig::default();
         let input = HookInput {
             hook_event_name: Some("Stop".to_string()),
             session_id: Some("thread".to_string()),
@@ -1596,7 +1603,8 @@ mod tests {
         assert!(!lower.contains("try rephrasing"));
         assert!(!lower.contains("trusted access for cyber"));
         assert!(!lower.contains("chatgpt.com/cyber"));
-        assert!(reason.contains("平台内容安全规则"));
+        assert!(reason.contains("内容安全"));
+        assert!(reason.contains(&cfg.recovery.continue_prompt));
     }
 
     #[test]
