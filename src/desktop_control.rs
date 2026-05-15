@@ -273,6 +273,7 @@ fn submit_prompt_to_current_codex_window(
     }
     insert_prompt_text(window.pid, prompt, attempt)?;
     std::thread::sleep(COMPOSER_AFTER_INSERT_SETTLE);
+    ensure_focused_prompt_text(window.pid, prompt)?;
     trigger_send(&window, attempt, placement)?;
     std::thread::sleep(POST_SEND_SETTLE);
     Ok(())
@@ -1312,27 +1313,328 @@ fn post_control_key_press(pid: i32, keycode: u16) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn insert_prompt_text(pid: i32, prompt: &str, attempt: usize) -> Result<()> {
-    let _ = attempt;
-    match text_input_method(attempt) {
-        TextInputMethod::ClipboardPaste => {
-            write_clipboard(prompt.as_bytes())?;
-            std::thread::sleep(PASTEBOARD_SETTLE);
-            post_command_v(pid)?;
+    let mut last_error: Option<anyhow::Error> = None;
+    for method in prompt_text_entry_methods(attempt) {
+        let result = match method {
+            PromptTextEntryMethod::FocusedAccessibility => {
+                set_prompt_with_accessibility(pid, prompt)
+            }
+            PromptTextEntryMethod::SystemEvents => set_prompt_with_system_events(prompt),
+            PromptTextEntryMethod::FocusedClipboard => {
+                write_clipboard(prompt.as_bytes())?;
+                std::thread::sleep(PASTEBOARD_SETTLE);
+                post_command_v(pid)?;
+                Ok(())
+            }
+        };
+        match result {
+            Ok(()) => match focused_prompt_text_state(pid, prompt) {
+                Ok(PromptTextState::Matches) | Ok(PromptTextState::Unreadable) => return Ok(()),
+                Ok(PromptTextState::Mismatch(actual)) => {
+                    last_error = Some(anyhow!(
+                        "focused Codex composer text mismatch after {method:?}: actual={}, expected={}",
+                        prompt_preview(&actual),
+                        prompt_preview(prompt)
+                    ));
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                }
+            },
+            Err(err) => {
+                last_error = Some(err);
+            }
         }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("Codex composer did not accept prompt text")))
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptTextEntryMethod {
+    FocusedAccessibility,
+    SystemEvents,
+    FocusedClipboard,
+}
+
+#[cfg(target_os = "macos")]
+fn prompt_text_entry_methods(attempt: usize) -> Vec<PromptTextEntryMethod> {
+    match attempt % 3 {
+        1 => vec![
+            PromptTextEntryMethod::SystemEvents,
+            PromptTextEntryMethod::FocusedAccessibility,
+            PromptTextEntryMethod::FocusedClipboard,
+        ],
+        _ => vec![
+            PromptTextEntryMethod::FocusedAccessibility,
+            PromptTextEntryMethod::SystemEvents,
+            PromptTextEntryMethod::FocusedClipboard,
+        ],
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_prompt_with_accessibility(pid: i32, prompt: &str) -> Result<()> {
+    let composer = focused_accessibility_element(pid)?;
+    if !is_attribute_settable(composer, "AXValue") {
+        return Err(anyhow!(
+            "focused AX element does not expose settable AXValue"
+        ));
+    }
+    set_accessibility_element_value(composer, prompt)?;
+    std::thread::sleep(Duration::from_millis(140));
+    if !accessibility_element_value_matches(composer, prompt)? {
+        return Err(anyhow!(
+            "AX composer text mismatch after set: actual={}, expected={}",
+            accessibility_element_value(composer)
+                .map(|value| prompt_preview(&value))
+                .unwrap_or_else(|| "<unreadable>".to_string()),
+            prompt_preview(prompt)
+        ));
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextInputMethod {
-    ClipboardPaste,
+fn ensure_focused_prompt_text(pid: i32, prompt: &str) -> Result<()> {
+    match focused_prompt_text_state(pid, prompt)? {
+        PromptTextState::Matches | PromptTextState::Unreadable => return Ok(()),
+        PromptTextState::Mismatch(_) => {}
+    }
+    set_prompt_with_accessibility(pid, prompt)?;
+    match focused_prompt_text_state(pid, prompt).unwrap_or(PromptTextState::Unreadable) {
+        PromptTextState::Matches | PromptTextState::Unreadable => return Ok(()),
+        PromptTextState::Mismatch(actual) => Err(anyhow!(
+            "focused Codex composer text mismatch before send: actual={}, expected={}",
+            prompt_preview(&actual),
+            prompt_preview(prompt)
+        )),
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn text_input_method(attempt: usize) -> TextInputMethod {
-    let _ = attempt;
-    TextInputMethod::ClipboardPaste
+fn set_prompt_with_system_events(prompt: &str) -> Result<()> {
+    const SCRIPT: &str = r#"
+on run argv
+    set promptText to item 1 of argv
+    tell application "System Events"
+        tell process "Codex"
+            try
+                set focusedElement to focused UI element
+                set value of focusedElement to promptText
+                delay 0.08
+                if ((value of focusedElement) as text) is promptText then
+                    return "focused"
+                end if
+            end try
+            try
+                repeat with candidate in (text areas of entire contents of window 1)
+                    try
+                        set value of candidate to promptText
+                        delay 0.08
+                        if ((value of candidate) as text) is promptText then
+                            try
+                                set focused of candidate to true
+                            end try
+                            return "text-area"
+                        end if
+                    end try
+                end repeat
+            end try
+        end tell
+    end tell
+    error "Codex composer text area not writable through System Events"
+end run
+"#;
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(SCRIPT)
+        .arg(prompt)
+        .output()
+        .context("failed to run System Events prompt writer")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow!(
+            "System Events prompt writer failed: {}",
+            stderr.trim()
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptTextState {
+    Matches,
+    Mismatch(String),
+    Unreadable,
+}
+
+#[cfg(target_os = "macos")]
+fn focused_prompt_text_state(pid: i32, prompt: &str) -> Result<PromptTextState> {
+    let Some(value) = focused_prompt_text(pid)? else {
+        return Ok(PromptTextState::Unreadable);
+    };
+    if strip_trailing_line_breaks(&value) == strip_trailing_line_breaks(prompt) {
+        Ok(PromptTextState::Matches)
+    } else {
+        Ok(PromptTextState::Mismatch(value))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn focused_prompt_text(pid: i32) -> Result<Option<String>> {
+    if let Ok(focused) = focused_accessibility_element(pid) {
+        let role = accessibility_attribute_string(focused, "AXRole");
+        if let Some(value) = accessibility_element_value(focused) {
+            if role.as_deref() == Some("AXWebArea") && value.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(value));
+        }
+        if role.as_deref() == Some("AXWebArea") {
+            return Ok(None);
+        }
+    }
+    Ok(focused_prompt_text_with_system_events())
+}
+
+#[cfg(target_os = "macos")]
+fn ax_application(pid: i32) -> Result<AXUIElementRef> {
+    let app = unsafe { AXUIElementCreateApplication(pid as libc::pid_t) };
+    if app.is_null() {
+        Err(anyhow!("failed to create AX application element"))
+    } else {
+        Ok(app)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn focused_accessibility_element(pid: i32) -> Result<AXUIElementRef> {
+    let app = ax_application(pid)?;
+    copy_ax_element_attribute(app, "AXFocusedUIElement")
+        .ok_or_else(|| anyhow!("failed to read AXFocusedUIElement"))
+}
+
+#[cfg(target_os = "macos")]
+fn set_accessibility_element_value(element: AXUIElementRef, value: &str) -> Result<()> {
+    if !is_attribute_settable(element, "AXValue") {
+        return Err(anyhow!("AXValue is not settable"));
+    }
+    let attr = CFString::from_static_string("AXValue");
+    let cf_value = CFString::new(value);
+    let result = unsafe {
+        AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())
+    };
+    if result == AX_ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(anyhow!("failed to set AXValue: {result}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn accessibility_element_value_matches(element: AXUIElementRef, prompt: &str) -> Result<bool> {
+    let Some(value) = accessibility_element_value(element) else {
+        return Ok(false);
+    };
+    Ok(strip_trailing_line_breaks(&value) == strip_trailing_line_breaks(prompt))
+}
+
+#[cfg(target_os = "macos")]
+fn accessibility_element_value(element: AXUIElementRef) -> Option<String> {
+    accessibility_attribute_string(element, "AXValue")
+}
+
+#[cfg(target_os = "macos")]
+fn accessibility_attribute_string(
+    element: AXUIElementRef,
+    attribute: &'static str,
+) -> Option<String> {
+    let attr = CFString::from_static_string(attribute);
+    let mut value: CFTypeRef = std::ptr::null();
+    let result =
+        unsafe { AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value) };
+    if result != AX_ERROR_SUCCESS || value.is_null() {
+        return None;
+    }
+    let guard = unsafe { CFType::wrap_under_create_rule(value) };
+    if let Some(string) = guard.downcast::<CFString>() {
+        return Some(string.to_string());
+    }
+    if let Some(boolean) = guard.downcast::<CFBoolean>() {
+        return Some((boolean == CFBoolean::true_value()).to_string());
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn focused_prompt_text_with_system_events() -> Option<String> {
+    const SCRIPT: &str = r#"
+tell application "System Events"
+    tell process "Codex"
+        try
+            return ((value of focused UI element) as text)
+        end try
+    end tell
+end tell
+"#;
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(SCRIPT)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_string(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn copy_ax_element_attribute(
+    element: AXUIElementRef,
+    attribute: &'static str,
+) -> Option<AXUIElementRef> {
+    let attr = CFString::from_static_string(attribute);
+    let mut value: CFTypeRef = std::ptr::null();
+    let result =
+        unsafe { AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value) };
+    if result == AX_ERROR_SUCCESS && !value.is_null() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn is_attribute_settable(element: AXUIElementRef, attribute: &'static str) -> bool {
+    let attr = CFString::from_static_string(attribute);
+    let mut settable: Boolean = 0;
+    let result = unsafe {
+        AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable)
+    };
+    result == AX_ERROR_SUCCESS && settable != 0
+}
+
+fn strip_trailing_line_breaks(value: &str) -> &str {
+    value.trim_end_matches(['\r', '\n'])
+}
+
+fn prompt_preview(value: &str) -> String {
+    let normalized = value.replace('\n', "\\n");
+    let mut chars = normalized.chars();
+    let preview = chars.by_ref().take(80).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else if preview.is_empty() {
+        "<empty>".to_string()
+    } else {
+        preview
+    }
 }
 
 fn post_key_press(pid: i32, keycode: u16, flags: CGEventFlags) -> Result<()> {
@@ -1425,11 +1727,19 @@ mod tests {
     }
 
     #[test]
-    fn visible_submit_uses_clipboard_only_to_avoid_unicode_single_character_pollution() {
-        assert_eq!(text_input_method(0), TextInputMethod::ClipboardPaste);
-        assert_eq!(text_input_method(1), TextInputMethod::ClipboardPaste);
-        assert_eq!(text_input_method(2), TextInputMethod::ClipboardPaste);
-        assert_eq!(text_input_method(3), TextInputMethod::ClipboardPaste);
+    fn visible_submit_prefers_readback_verified_text_entry() {
+        assert_eq!(
+            prompt_text_entry_methods(0).first(),
+            Some(&PromptTextEntryMethod::FocusedAccessibility)
+        );
+        assert!(prompt_text_entry_methods(0).contains(&PromptTextEntryMethod::SystemEvents));
+        assert!(prompt_text_entry_methods(0).contains(&PromptTextEntryMethod::FocusedClipboard));
+        assert!(!prompt_text_entry_methods(0).iter().any(|method| !matches!(
+            method,
+            PromptTextEntryMethod::FocusedAccessibility
+                | PromptTextEntryMethod::SystemEvents
+                | PromptTextEntryMethod::FocusedClipboard
+        )));
     }
 
     #[test]

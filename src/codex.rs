@@ -26,6 +26,7 @@ const ROLLOUT_FEEDBACK_SCAN_BYTES: u64 = 1024 * 1024;
 const ROLLOUT_MAX_PARSE_LINE_BYTES: usize = 512 * 1024;
 const VISIBLE_SUBMIT_ATTEMPTS: usize = 4;
 const VISIBLE_SUBMIT_WAIT: Duration = Duration::from_secs(5);
+const NEW_THREAD_SUBMIT_WAIT: Duration = Duration::from_secs(15);
 const VISIBLE_SUBMIT_FAST_PROBE_WAIT: Duration = Duration::from_millis(1_600);
 const VISIBLE_SUBMIT_DB_WAIT: Duration = Duration::from_millis(2_400);
 const VISIBLE_SUBMIT_PROBE_GRACE_SECONDS: i64 = 2;
@@ -1549,7 +1550,7 @@ pub fn start_new_thread(
     for attempt in 0..VISIBLE_SUBMIT_ATTEMPTS {
         desktop_control::submit_new_thread_prompt_to_visible_window(prompt, attempt)?;
         if let Some(thread) =
-            wait_for_new_thread_match(&before, prompt, started_at, VISIBLE_SUBMIT_WAIT)?
+            wait_for_new_thread_match(&before, prompt, started_at, NEW_THREAD_SUBMIT_WAIT)?
         {
             result.thread_id = Some(thread.id);
             return Ok(result);
@@ -1973,6 +1974,11 @@ mod tests {
         assert!(VISIBLE_SUBMIT_FAST_PROBE_WAIT <= Duration::from_secs(2));
         assert!(VISIBLE_SUBMIT_DB_WAIT <= Duration::from_secs(3));
         assert!(VISIBLE_SUBMIT_WAIT <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn new_thread_confirmation_wait_covers_real_desktop_write_latency() {
+        assert!(NEW_THREAD_SUBMIT_WAIT >= Duration::from_secs(12));
     }
 
     #[test]
