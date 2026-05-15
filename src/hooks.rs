@@ -284,7 +284,7 @@ pub fn run_stop_hook_from_stdin() -> Result<()> {
 }
 
 pub async fn run_notify_completion_from_stdin() -> Result<()> {
-    let notification = read_completion_notification()?;
+    let notification = hydrate_completion_notification_feedback(read_completion_notification()?);
     let cfg = config::load_or_create().unwrap_or_default();
     if !should_notify_completion(&cfg, &notification) {
         tracing::debug!(
@@ -1101,6 +1101,25 @@ fn read_completion_notification() -> Result<CompletionNotification> {
     serde_json::from_str(&raw).context("failed to parse completion notification JSON from stdin")
 }
 
+fn hydrate_completion_notification_feedback(
+    mut notification: CompletionNotification,
+) -> CompletionNotification {
+    let Some(thread_id) = completion_notification_thread_id(&notification).map(str::to_string)
+    else {
+        return notification;
+    };
+    if let Ok(feedback) = codex::latest_thread_feedback(&thread_id) {
+        notification.latest_feedback = Some(HookFeedbackSnapshot {
+            thread_id: feedback.thread_id,
+            title: feedback.title,
+            timestamp: feedback.timestamp,
+            text: feedback.text,
+            internal_thread: feedback.internal_thread,
+        });
+    }
+    notification
+}
+
 fn should_notify_completion(cfg: &AppConfig, notification: &CompletionNotification) -> bool {
     cfg.observability.completion_notifications_enabled
         && notification
@@ -1110,6 +1129,13 @@ fn should_notify_completion(cfg: &AppConfig, notification: &CompletionNotificati
 }
 
 fn format_completion_notification(notification: &CompletionNotification) -> String {
+    completion_notification_message(notification, 0).text
+}
+
+fn completion_notification_message(
+    notification: &CompletionNotification,
+    page: usize,
+) -> telegram::FeedbackMessage {
     let title = notification
         .latest_feedback
         .as_ref()
@@ -1134,13 +1160,7 @@ fn format_completion_notification(notification: &CompletionNotification) -> Stri
         .map(feedback_timestamp_label)
         .unwrap_or_else(|| "无时间戳".to_string());
 
-    format!(
-        "线程正常完成\n{}\n{}\n\n最后反馈时间：{}\n最后反馈：\n{}",
-        title,
-        thread_id,
-        feedback_time,
-        truncate(feedback_text, 2600)
-    )
+    telegram::completion_feedback_message(title, thread_id, &feedback_time, feedback_text, page)
 }
 
 fn feedback_timestamp_label(timestamp: &str) -> String {
@@ -1163,13 +1183,8 @@ fn beijing_offset() -> FixedOffset {
 }
 
 fn completion_notification_keyboard(notification: &CompletionNotification) -> Option<Value> {
-    let thread_id = completion_notification_thread_id(notification)?;
-    Some(json!({
-        "inline_keyboard": [[{
-            "text": "追加指令",
-            "callback_data": format!("ask:{thread_id}")
-        }]]
-    }))
+    completion_notification_thread_id(notification)?;
+    completion_notification_message(notification, 0).keyboard
 }
 
 fn completion_notification_thread_id(notification: &CompletionNotification) -> Option<&str> {
@@ -1555,6 +1570,33 @@ mod tests {
             keyboard["inline_keyboard"][0][0]["callback_data"].as_str(),
             Some("ask:thread-a")
         );
+    }
+
+    #[test]
+    fn normal_completion_notification_paginates_long_latest_feedback_snapshot() {
+        let mut feedback = test_feedback_snapshot("thread-a");
+        feedback.text = "最终反馈很长。".repeat(900);
+        let notification = CompletionNotification {
+            event: Some("Stop".to_string()),
+            session_id: Some("thread-a".to_string()),
+            turn_id: Some("turn-a".to_string()),
+            cwd: Some("/Users/gosu/Documents".to_string()),
+            model: Some("gpt".to_string()),
+            source: "last_assistant_message".to_string(),
+            body: "任务已经完成，验证通过。".to_string(),
+            latest_feedback: Some(feedback),
+        };
+
+        let text = format_completion_notification(&notification);
+        assert!(text.contains("线程正常完成"));
+        assert!(text.contains("最后反馈（第 1/"));
+
+        let keyboard = completion_notification_keyboard(&notification).unwrap();
+        let raw = serde_json::to_string(&keyboard).unwrap();
+        assert!(raw.contains("下一页"));
+        assert!(raw.contains("cfb:thread-a:1"));
+        assert!(raw.contains("追加指令"));
+        assert!(raw.contains("ask:thread-a"));
     }
 
     #[test]

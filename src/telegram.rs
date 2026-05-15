@@ -17,6 +17,8 @@ const TELEGRAM_GET_UPDATES_TIMEOUT_SECONDS: u64 = 10;
 const TELEGRAM_HTTP_TIMEOUT_SECONDS: u64 = 12;
 const TELEGRAM_ERROR_BACKOFF_SECONDS: u64 = 2;
 const RECOVERY_FAILURE_BACKOFF_SECONDS: u64 = 60;
+const TELEGRAM_SEND_TEXT_LIMIT: usize = 3800;
+const FEEDBACK_PAGE_BYTES: usize = 2400;
 
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
@@ -61,6 +63,12 @@ struct User {
 struct BotReply {
     text: String,
     keyboard: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FeedbackMessage {
+    pub text: String,
+    pub keyboard: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -577,6 +585,14 @@ async fn handle_callback(
         pending.remove(&chat_id);
         return main_menu_reply();
     }
+    if let Some((thread_id, page)) = parse_feedback_page_callback(data, "tfb") {
+        pending.remove(&chat_id);
+        return thread_detail_page_reply(thread_id, page);
+    }
+    if let Some((thread_id, page)) = parse_feedback_page_callback(data, "cfb") {
+        pending.remove(&chat_id);
+        return completion_feedback_page_reply(thread_id, page);
+    }
     if let Some(thread_id) = data.strip_prefix("thread:") {
         pending.remove(&chat_id);
         return thread_detail_reply(thread_id);
@@ -855,16 +871,36 @@ fn thread_list_reply() -> Result<BotReply> {
 }
 
 fn thread_detail_reply(thread_id: &str) -> Result<BotReply> {
+    thread_detail_page_reply(thread_id, 0)
+}
+
+fn thread_detail_page_reply(thread_id: &str, page: usize) -> Result<BotReply> {
     let feedback = codex::latest_thread_feedback(thread_id)?;
+    let message = thread_feedback_message(
+        &feedback.title,
+        &feedback.thread_id,
+        &feedback_timestamp_label(feedback.timestamp.as_deref()),
+        &feedback.text,
+        page,
+    );
     Ok(BotReply {
-        text: format!(
-            "线程：{}\n{}\n\n最后反馈时间：{}\n最后反馈：\n{}",
-            feedback.title,
-            feedback.thread_id,
-            feedback_timestamp_label(feedback.timestamp.as_deref()),
-            truncate(&feedback.text, 2500)
-        ),
-        keyboard: Some(thread_actions_keyboard(thread_id)),
+        text: message.text,
+        keyboard: message.keyboard,
+    })
+}
+
+fn completion_feedback_page_reply(thread_id: &str, page: usize) -> Result<BotReply> {
+    let feedback = codex::latest_thread_feedback(thread_id)?;
+    let message = completion_feedback_message(
+        &feedback.title,
+        &feedback.thread_id,
+        &feedback_timestamp_label(feedback.timestamp.as_deref()),
+        &feedback.text,
+        page,
+    );
+    Ok(BotReply {
+        text: message.text,
+        keyboard: message.keyboard,
     })
 }
 
@@ -919,6 +955,181 @@ fn thread_actions_keyboard(thread_id: &str) -> Value {
             ]
         ]
     })
+}
+
+pub(crate) fn thread_feedback_message(
+    title: &str,
+    thread_id: &str,
+    feedback_time: &str,
+    feedback_text: &str,
+    page: usize,
+) -> FeedbackMessage {
+    let page = feedback_page(feedback_text, page);
+    FeedbackMessage {
+        text: format!(
+            "线程：{}\n{}\n\n最后反馈时间：{}\n{}",
+            title,
+            thread_id,
+            feedback_time,
+            format_feedback_page("最后反馈", &page)
+        ),
+        keyboard: Some(thread_feedback_keyboard(thread_id, page.index, page.total)),
+    }
+}
+
+pub(crate) fn completion_feedback_message(
+    title: &str,
+    thread_id: &str,
+    feedback_time: &str,
+    feedback_text: &str,
+    page: usize,
+) -> FeedbackMessage {
+    let page = feedback_page(feedback_text, page);
+    FeedbackMessage {
+        text: format!(
+            "线程正常完成\n{}\n{}\n\n最后反馈时间：{}\n{}",
+            title,
+            thread_id,
+            feedback_time,
+            format_feedback_page("最后反馈", &page)
+        ),
+        keyboard: Some(completion_feedback_keyboard(
+            thread_id, page.index, page.total,
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct FeedbackPage {
+    text: String,
+    index: usize,
+    total: usize,
+}
+
+fn feedback_page(text: &str, requested_page: usize) -> FeedbackPage {
+    let pages = feedback_pages(text, FEEDBACK_PAGE_BYTES);
+    let total = pages.len();
+    let index = clamp_feedback_page(requested_page, total);
+    FeedbackPage {
+        text: pages.get(index).cloned().unwrap_or_default(),
+        index,
+        total,
+    }
+}
+
+fn feedback_pages(text: &str, page_size: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let page_size = page_size.max(4);
+    let mut pages = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = start.saturating_add(page_size).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = text[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(idx, _)| start + idx)
+                .unwrap_or(text.len());
+        }
+        pages.push(text[start..end].to_string());
+        start = end;
+    }
+    pages
+}
+
+fn clamp_feedback_page(page: usize, page_count: usize) -> usize {
+    page.min(page_count.saturating_sub(1))
+}
+
+fn format_feedback_page(label: &str, page: &FeedbackPage) -> String {
+    if page.total > 1 {
+        format!(
+            "{}（第 {}/{} 页）：\n{}",
+            label,
+            page.index + 1,
+            page.total,
+            page.text
+        )
+    } else {
+        format!("{}：\n{}", label, page.text)
+    }
+}
+
+fn thread_feedback_keyboard(thread_id: &str, page: usize, page_count: usize) -> Value {
+    let mut rows = Vec::new();
+    if let Some(row) = feedback_pagination_row("tfb", thread_id, page, page_count) {
+        rows.push(row);
+    }
+    rows.push(vec![
+        json!({"text": "继续", "callback_data": format!("cont:{thread_id}")}),
+        json!({"text": "输入指令", "callback_data": format!("ask:{thread_id}")}),
+    ]);
+    rows.push(vec![
+        json!({"text": "刷新反馈", "callback_data": feedback_page_callback("tfb", thread_id, page)}),
+        json!({"text": "线程列表", "callback_data": "threads"}),
+    ]);
+    rows.push(vec![
+        json!({"text": "删除线程", "callback_data": format!("del:{thread_id}")}),
+        json!({"text": "主菜单", "callback_data": "menu"}),
+    ]);
+    json!({ "inline_keyboard": rows })
+}
+
+fn completion_feedback_keyboard(thread_id: &str, page: usize, page_count: usize) -> Value {
+    let mut rows = Vec::new();
+    if let Some(row) = feedback_pagination_row("cfb", thread_id, page, page_count) {
+        rows.push(row);
+    }
+    rows.push(vec![json!({
+        "text": "追加指令",
+        "callback_data": format!("ask:{thread_id}")
+    })]);
+    json!({ "inline_keyboard": rows })
+}
+
+fn feedback_pagination_row(
+    prefix: &str,
+    thread_id: &str,
+    page: usize,
+    page_count: usize,
+) -> Option<Vec<Value>> {
+    if page_count <= 1 {
+        return None;
+    }
+    let mut row = Vec::new();
+    if page > 0 {
+        row.push(json!({
+            "text": "上一页",
+            "callback_data": feedback_page_callback(prefix, thread_id, page - 1)
+        }));
+    }
+    if page + 1 < page_count {
+        row.push(json!({
+            "text": "下一页",
+            "callback_data": feedback_page_callback(prefix, thread_id, page + 1)
+        }));
+    }
+    if row.is_empty() { None } else { Some(row) }
+}
+
+fn feedback_page_callback(prefix: &str, thread_id: &str, page: usize) -> String {
+    let callback = format!("{prefix}:{thread_id}:{page}");
+    debug_assert!(callback.len() <= 64);
+    callback
+}
+
+fn parse_feedback_page_callback<'a>(data: &'a str, prefix: &str) -> Option<(&'a str, usize)> {
+    let rest = data.strip_prefix(prefix)?.strip_prefix(':')?;
+    let (thread_id, page) = rest.rsplit_once(':')?;
+    if thread_id.trim().is_empty() {
+        return None;
+    }
+    Some((thread_id, page.parse::<usize>().unwrap_or(0)))
 }
 
 async fn continue_thread_reply(cfg: &AppConfig, thread_id: &str) -> Result<BotReply> {
@@ -1249,7 +1460,7 @@ async fn send_message(
     text: &str,
     keyboard: Option<Value>,
 ) -> Result<()> {
-    let mut body = json!({"chat_id": chat_id, "text": truncate(text, 3800)});
+    let mut body = json!({"chat_id": chat_id, "text": truncate(text, TELEGRAM_SEND_TEXT_LIMIT)});
     if let Some(keyboard) = keyboard {
         body["reply_markup"] = keyboard;
     }
@@ -1422,6 +1633,96 @@ mod tests {
             "2026-05-14 09:27:03 北京时间"
         );
         assert_eq!(feedback_timestamp_label(None), "无时间戳");
+    }
+
+    #[test]
+    fn thread_feedback_message_paginates_long_feedback() {
+        let feedback = "甲".repeat(3_500);
+
+        let page = thread_feedback_message(
+            "长反馈线程",
+            "thread-a",
+            "2026-05-14 09:27:03 北京时间",
+            &feedback,
+            0,
+        );
+
+        assert!(page.text.contains("最后反馈（第 1/"));
+        assert!(page.text.len() < feedback.len());
+        let raw_keyboard = serde_json::to_string(&page.keyboard).unwrap();
+        assert!(raw_keyboard.contains("下一页"));
+        assert!(raw_keyboard.contains("tfb:thread-a:1"));
+        assert!(!raw_keyboard.contains("上一页"));
+
+        let next = thread_feedback_message(
+            "长反馈线程",
+            "thread-a",
+            "2026-05-14 09:27:03 北京时间",
+            &feedback,
+            1,
+        );
+        assert!(next.text.contains("最后反馈（第 2/"));
+        let next_keyboard = serde_json::to_string(&next.keyboard).unwrap();
+        assert!(next_keyboard.contains("上一页"));
+        assert!(next_keyboard.contains("tfb:thread-a:0"));
+    }
+
+    #[test]
+    fn completion_feedback_message_paginates_and_keeps_append_button() {
+        let feedback = "乙".repeat(3_500);
+
+        let page = completion_feedback_message(
+            "完成线程",
+            "thread-a",
+            "2026-05-14 09:27:03 北京时间",
+            &feedback,
+            0,
+        );
+
+        assert!(page.text.starts_with("线程正常完成\n完成线程\nthread-a"));
+        assert!(page.text.contains("最后反馈（第 1/"));
+        let raw_keyboard = serde_json::to_string(&page.keyboard).unwrap();
+        assert!(raw_keyboard.contains("下一页"));
+        assert!(raw_keyboard.contains("cfb:thread-a:1"));
+        assert!(raw_keyboard.contains("追加指令"));
+        assert!(raw_keyboard.contains("ask:thread-a"));
+    }
+
+    #[test]
+    fn feedback_pages_preserve_multibyte_text() {
+        let feedback = "第一页甲第二页乙第三页丙".repeat(400);
+        let pages = feedback_pages(&feedback, 401);
+
+        assert!(pages.len() > 1);
+        assert_eq!(pages.join(""), feedback);
+        assert!(pages.iter().all(|page| page.len() <= 401));
+    }
+
+    #[test]
+    fn short_feedback_omits_pagination_buttons() {
+        let page = thread_feedback_message("短反馈线程", "thread-a", "无时间戳", "短反馈", 0);
+        let raw_keyboard = serde_json::to_string(&page.keyboard).unwrap();
+
+        assert!(!raw_keyboard.contains("上一页"));
+        assert!(!raw_keyboard.contains("下一页"));
+        assert!(raw_keyboard.contains("ask:thread-a"));
+    }
+
+    #[test]
+    fn feedback_page_callbacks_parse_and_stay_under_telegram_limit() {
+        let thread_id = "019e2aba-ee19-7a83-a279-b09b192c2252";
+        let callback = feedback_page_callback("tfb", thread_id, 12);
+
+        assert!(callback.len() <= 64);
+        assert_eq!(
+            parse_feedback_page_callback(&callback, "tfb"),
+            Some((thread_id, 12))
+        );
+        assert_eq!(
+            parse_feedback_page_callback("tfb:thread-a:not-a-page", "tfb"),
+            Some(("thread-a", 0))
+        );
+        assert!(parse_feedback_page_callback("thread:thread-a", "tfb").is_none());
     }
 
     #[test]
