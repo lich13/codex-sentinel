@@ -36,6 +36,8 @@ pub enum ControlAction {
     Continue {
         thread_id: String,
         prompt: String,
+        #[serde(default)]
+        mode: codex::ContinueSubmissionMode,
     },
     NewThread {
         prompt: String,
@@ -188,8 +190,12 @@ fn execute_request(request: &ControlRequest) -> ControlResponse {
 
 fn execute_action(action: &ControlAction) -> Result<ControlResponse> {
     match action {
-        ControlAction::Continue { thread_id, prompt } => {
-            let turn_id = codex::continue_thread(thread_id, prompt)?;
+        ControlAction::Continue {
+            thread_id,
+            prompt,
+            mode,
+        } => {
+            let turn_id = codex::continue_thread_with_mode(thread_id, prompt, *mode)?;
             Ok(ControlResponse {
                 request_id: String::new(),
                 completed_at: now_ts(),
@@ -359,9 +365,26 @@ mod tests {
         let action = ControlAction::Continue {
             thread_id: "t".to_string(),
             prompt: "p".to_string(),
+            mode: codex::ContinueSubmissionMode::StrictPrompt,
         };
         let raw = serde_json::to_string(&action).unwrap();
         assert!(raw.contains("\"kind\":\"continue\""));
+        assert!(raw.contains("\"mode\":\"strict_prompt\""));
+    }
+
+    #[test]
+    fn continue_action_defaults_to_strict_prompt_mode() {
+        let raw = r#"{"kind":"continue","thread_id":"t","prompt":"p"}"#;
+        let action: ControlAction = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(
+            action,
+            ControlAction::Continue {
+                thread_id: "t".to_string(),
+                prompt: "p".to_string(),
+                mode: codex::ContinueSubmissionMode::StrictPrompt,
+            }
+        );
     }
 
     #[test]
@@ -379,6 +402,7 @@ mod tests {
             action: ControlAction::Continue {
                 thread_id: "thread".to_string(),
                 prompt: "prompt".to_string(),
+                mode: codex::ContinueSubmissionMode::StrictPrompt,
             },
         };
 
@@ -391,6 +415,7 @@ mod tests {
         let action = ControlAction::Continue {
             thread_id: "thread".to_string(),
             prompt: "prompt".to_string(),
+            mode: codex::ContinueSubmissionMode::StrictPrompt,
         };
         let requests = vec![ControlRequest {
             id: "request-a".to_string(),

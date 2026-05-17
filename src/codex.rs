@@ -108,6 +108,14 @@ pub struct ThreadFeedback {
     pub internal_thread: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinueSubmissionMode {
+    #[default]
+    StrictPrompt,
+    RecoveryProgress,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunningThread {
     pub thread: ThreadSummary,
@@ -1101,10 +1109,7 @@ fn scan_rollout_recovery(
             }
         }
 
-        if is_user_message(&value)
-            || is_agent_or_assistant_message(&value)
-            || is_successful_task_complete(&value)
-        {
+        if is_agent_or_assistant_message(&value) || is_successful_task_complete(&value) {
             return Ok(RolloutRecoveryScan {
                 recovery: None,
                 normal_progress_ts: Some(ts),
@@ -1168,21 +1173,6 @@ fn rollout_recovery_text(thread_id: &str, value: &Value) -> Option<String> {
     }
 
     None
-}
-
-fn is_user_message(value: &Value) -> bool {
-    let Some(payload) = value.get("payload") else {
-        return false;
-    };
-    if value.get("type").and_then(Value::as_str) == Some("response_item")
-        && payload.get("type").and_then(Value::as_str) == Some("message")
-        && payload.get("role").and_then(Value::as_str) == Some("user")
-    {
-        return true;
-    }
-
-    value.get("type").and_then(Value::as_str) == Some("event_msg")
-        && payload.get("type").and_then(Value::as_str) == Some("user_message")
 }
 
 fn is_agent_or_assistant_message(value: &Value) -> bool {
@@ -1583,7 +1573,11 @@ fn unique_dest(path: &Path) -> PathBuf {
     unreachable!()
 }
 
-pub fn continue_thread(thread_id: &str, prompt: &str) -> Result<String> {
+pub fn continue_thread_with_mode(
+    thread_id: &str,
+    prompt: &str,
+    mode: ContinueSubmissionMode,
+) -> Result<String> {
     let baseline = read_thread_submit_marker(thread_id)?;
     desktop_control::prepare_existing_thread_visible(thread_id)?;
     let submit_baseline = read_thread_submit_marker(thread_id).unwrap_or(baseline.clone());
@@ -1601,6 +1595,7 @@ pub fn continue_thread(thread_id: &str, prompt: &str) -> Result<String> {
             submit_baseline_probe.as_ref(),
             attempt_started_at,
             prompt,
+            mode,
             VISIBLE_SUBMIT_WAIT,
         )? {
             tracing::info!(
@@ -1630,6 +1625,7 @@ fn wait_for_thread_submission(
     baseline_probe: Option<&ThreadProbe>,
     attempt_started_at: i64,
     prompt: &str,
+    mode: ContinueSubmissionMode,
     timeout: Duration,
 ) -> Result<bool> {
     let fast_deadline = Instant::now() + VISIBLE_SUBMIT_FAST_PROBE_WAIT.min(timeout);
@@ -1639,7 +1635,7 @@ fn wait_for_thread_submission(
             .flatten();
         if probe.as_ref().is_some_and(|probe| {
             thread_probe_confirms_submission(probe, baseline_probe, attempt_started_at)
-        }) && thread_latest_user_prompt_matches(thread_id, prompt, attempt_started_at)?
+        }) && thread_submission_mode_matches(mode, thread_id, prompt, attempt_started_at)?
         {
             return Ok(true);
         }
@@ -1650,7 +1646,7 @@ fn wait_for_thread_submission(
     while Instant::now() < db_deadline {
         let current = read_thread_submit_marker(thread_id)?;
         if current.updated_at_ms > baseline_updated_at_ms
-            && submit_marker_latest_user_prompt_matches(&current, prompt, attempt_started_at)
+            && submit_marker_matches_submission_mode(&current, prompt, attempt_started_at, mode)
         {
             return Ok(true);
         }
@@ -1662,7 +1658,7 @@ fn wait_for_thread_submission(
         .flatten();
     Ok(probe.as_ref().is_some_and(|probe| {
         thread_probe_confirms_submission(probe, baseline_probe, attempt_started_at)
-    }) && thread_latest_user_prompt_matches(thread_id, prompt, attempt_started_at)?)
+    }) && thread_submission_mode_matches(mode, thread_id, prompt, attempt_started_at)?)
 }
 
 pub fn start_new_thread(
@@ -1799,6 +1795,20 @@ fn prompts_match(stored: &str, prompt: &str) -> bool {
     normalize_prompt(stored) == normalize_prompt(prompt)
 }
 
+fn thread_submission_mode_matches(
+    mode: ContinueSubmissionMode,
+    thread_id: &str,
+    prompt: &str,
+    attempt_started_at: i64,
+) -> Result<bool> {
+    match mode {
+        ContinueSubmissionMode::StrictPrompt => {
+            thread_latest_user_prompt_matches(thread_id, prompt, attempt_started_at)
+        }
+        ContinueSubmissionMode::RecoveryProgress => Ok(true),
+    }
+}
+
 fn thread_latest_user_prompt_matches(
     thread_id: &str,
     prompt: &str,
@@ -1810,6 +1820,20 @@ fn thread_latest_user_prompt_matches(
         prompt,
         attempt_started_at,
     ))
+}
+
+fn submit_marker_matches_submission_mode(
+    marker: &ThreadSubmitMarker,
+    prompt: &str,
+    attempt_started_at: i64,
+    mode: ContinueSubmissionMode,
+) -> bool {
+    match mode {
+        ContinueSubmissionMode::StrictPrompt => {
+            submit_marker_latest_user_prompt_matches(marker, prompt, attempt_started_at)
+        }
+        ContinueSubmissionMode::RecoveryProgress => true,
+    }
 }
 
 fn submit_marker_latest_user_prompt_matches(
@@ -2584,6 +2608,7 @@ mod tests {
             None,
             1778782134,
             "把5.14 5.15两天的活动都落盘到活动库里，给我补推5.15的日报，以后日报标题格式改为5月15日玩卡薅羊毛活动这种格式",
+            ContinueSubmissionMode::StrictPrompt,
             Duration::from_millis(10),
         )
         .unwrap();
@@ -2642,6 +2667,7 @@ mod tests {
             None,
             1778782134,
             prompt,
+            ContinueSubmissionMode::StrictPrompt,
             Duration::from_millis(120),
         )
         .unwrap();
@@ -2650,6 +2676,107 @@ mod tests {
         let _ = fs::remove_file(rollout);
         let _ = fs::remove_file(db);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_continue_accepts_thread_update_without_prompt_match() {
+        let root = temp_db_path("recovery-continue-progress-root");
+        let _ = fs::remove_file(&root);
+        fs::create_dir_all(&root).unwrap();
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let _home = HomeEnvGuard::set(&home);
+
+        let rollout = root.join("rollout.jsonl");
+        let raw = serde_json::to_string(&json!({
+            "timestamp": "2026-05-14T18:08:56.960Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "式\n"}
+                ]
+            }
+        }))
+        .unwrap();
+        fs::write(&rollout, raw).unwrap();
+
+        let db = home.join(".codex").join("state_5.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                updated_at INTEGER NOT NULL,
+                updated_at_ms INTEGER,
+                rollout_path TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, updated_at, updated_at_ms, rollout_path)
+             VALUES ('thread-a', 1778782136, 1778782136960, ?1)",
+            [&rollout.display().to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let confirmed = wait_for_thread_submission(
+            "thread-a",
+            1778782076000,
+            None,
+            1778782134,
+            "继续干。请先检查当前线程最近状态和工具输出，不要从头开始。",
+            ContinueSubmissionMode::RecoveryProgress,
+            Duration::from_millis(120),
+        )
+        .unwrap();
+
+        assert!(confirmed);
+        let _ = fs::remove_file(rollout);
+        let _ = fs::remove_file(db);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollout_lookup_keeps_silent_completion_recoverable_after_user_message() {
+        let path = temp_db_path("rollout-user-after-silent").with_extension("jsonl");
+        let raw = [
+            serde_json::to_string(&json!({
+                "timestamp": "2026-05-09T17:25:10.023Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-silent",
+                    "last_agent_message": null,
+                    "completed_at": 1778347510
+                }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "timestamp": "2026-05-09T17:26:10.023Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "继续干。请先检查当前线程最近状态和工具输出。"
+                }
+            }))
+            .unwrap(),
+        ]
+        .join("\n");
+        fs::write(&path, raw).expect("write rollout");
+
+        let event = latest_recovery_event_from_rollout_path(&path, "thread-a", 1778347000)
+            .expect("lookup succeeds")
+            .expect("silent completion remains recoverable");
+        assert!(event.body.contains("Silent turn completion"));
+
+        let progress = latest_normal_progress_from_rollout(&path, 1778347000)
+            .expect("progress lookup succeeds");
+        assert!(progress.is_none());
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

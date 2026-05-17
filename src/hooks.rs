@@ -632,6 +632,7 @@ fn stop_hook_recovery_request(
         action: control_queue::ControlAction::Continue {
             thread_id: thread_id.to_string(),
             prompt: recovery_prompt_for_request(cfg, decision),
+            mode: crate::codex::ContinueSubmissionMode::RecoveryProgress,
         },
     })
 }
@@ -1950,7 +1951,8 @@ mod tests {
             request.action,
             crate::control_queue::ControlAction::Continue {
                 thread_id: "thread-a".to_string(),
-                prompt: "继续".to_string()
+                prompt: "继续".to_string(),
+                mode: crate::codex::ContinueSubmissionMode::RecoveryProgress,
             }
         );
         assert_eq!(request.not_before, None);

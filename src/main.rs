@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
             let result = control_queue::submit_and_wait(control_queue::ControlAction::Continue {
                 thread_id,
                 prompt: cfg.recovery.continue_prompt,
+                mode: codex::ContinueSubmissionMode::StrictPrompt,
             })?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
@@ -87,6 +88,7 @@ async fn main() -> Result<()> {
             let result = control_queue::submit_and_wait(control_queue::ControlAction::Continue {
                 thread_id,
                 prompt: prompt.to_string(),
+                mode: codex::ContinueSubmissionMode::StrictPrompt,
             })?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }

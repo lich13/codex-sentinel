@@ -349,6 +349,7 @@ fn continue_current_thread(
     let response = control_queue::submit_and_wait(control_queue::ControlAction::Continue {
         thread_id: thread_id.clone(),
         prompt: cfg.recovery.continue_prompt,
+        mode: codex::ContinueSubmissionMode::StrictPrompt,
     })
     .map_err(format_error)?;
     let turn_id = response.turn_id.unwrap_or_default();
@@ -371,6 +372,7 @@ fn submit_thread_instruction(
     control_queue::submit_and_wait(control_queue::ControlAction::Continue {
         thread_id: thread_id.to_string(),
         prompt: prompt.to_string(),
+        mode: codex::ContinueSubmissionMode::StrictPrompt,
     })
     .map_err(format_error)
 }

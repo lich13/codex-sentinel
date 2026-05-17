@@ -400,6 +400,7 @@ async fn handle_message(
                         control_queue::submit_and_wait(control_queue::ControlAction::Continue {
                             thread_id: thread_id.clone(),
                             prompt: trimmed.to_string(),
+                            mode: codex::ContinueSubmissionMode::StrictPrompt,
                         })?;
                     return Ok(BotReply {
                         text: format!(
@@ -1140,6 +1141,7 @@ async fn continue_thread_with_prompt_reply(thread_id: &str, prompt: &str) -> Res
     let response = control_queue::submit_and_wait(control_queue::ControlAction::Continue {
         thread_id: thread_id.to_string(),
         prompt: prompt.to_string(),
+        mode: codex::ContinueSubmissionMode::StrictPrompt,
     })?;
     Ok(BotReply {
         text: format!(
@@ -1310,6 +1312,7 @@ async fn recover_candidate(
     let response = match control_queue::submit_and_wait(control_queue::ControlAction::Continue {
         thread_id: thread.id.clone(),
         prompt,
+        mode: recovery_continue_submission_mode(automatic),
     }) {
         Ok(response) => response,
         Err(err) => {
@@ -1338,6 +1341,14 @@ async fn recover_candidate(
         "已通过 Codex APP 可见窗口恢复\n原因：{}\n线程：{}\nturn：{}",
         decision.label, thread.id, turn
     ))
+}
+
+fn recovery_continue_submission_mode(automatic: bool) -> codex::ContinueSubmissionMode {
+    if automatic {
+        codex::ContinueSubmissionMode::RecoveryProgress
+    } else {
+        codex::ContinueSubmissionMode::StrictPrompt
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1747,6 +1758,18 @@ mod tests {
         };
         assert!(!counter.failure_backoff_active());
         assert!(counter.can_run(10, 5));
+    }
+
+    #[test]
+    fn only_automatic_recovery_uses_progress_confirmation() {
+        assert_eq!(
+            recovery_continue_submission_mode(true),
+            codex::ContinueSubmissionMode::RecoveryProgress
+        );
+        assert_eq!(
+            recovery_continue_submission_mode(false),
+            codex::ContinueSubmissionMode::StrictPrompt
+        );
     }
 
     #[test]
