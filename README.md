@@ -44,13 +44,15 @@ Telegram 主菜单保持极简：
 
 ## 菜单栏
 
-Sentinel 不常驻 Dock，只常驻 macOS 菜单栏。左键点击图标会打开控制台；菜单里保留三个动作：
+Sentinel 不常驻 Dock，只常驻 macOS 菜单栏。左键点击图标会打开控制台；菜单里保留这些动作：
 
 - `打开控制台`
 - `可见自动恢复`
+- `清除归档`
 - `退出 Codex Sentinel`
 
 `可见自动恢复` 会同步写入 `~/.codex-sentinel/config.toml`，同时打开或关闭本地 watcher。
+`清除归档` 会复用同一条控制队列清理已经归档的线程记录，并把归档 rollout 移到当前用户的 macOS 废纸篓。
 
 ## 跟随 Codex 启停
 

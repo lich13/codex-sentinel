@@ -16,11 +16,20 @@ use crate::{codex, config, control_queue, desktop_control, hooks, lifecycle, mai
 const TRAY_ID: &str = "main";
 const TRAY_MENU_SHOW: &str = "tray-show";
 const TRAY_MENU_AUTO_RECOVER: &str = "tray-auto-recover";
+const TRAY_MENU_CLEAR_ARCHIVED: &str = "tray-clear-archived";
 const TRAY_MENU_QUIT: &str = "tray-quit";
 const TELEGRAM_PANEL_HTTP_TIMEOUT_SECONDS: u64 = 20;
 
 struct TrayMenuState {
     auto_recover: CheckMenuItem<tauri::Wry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayMenuAction {
+    Show,
+    ToggleAutoRecover,
+    ClearArchived,
+    Quit,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,14 +194,19 @@ pub fn run_gui() -> Result<()> {
             install_tray_menu(app)?;
             Ok(())
         })
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            TRAY_MENU_SHOW => show_main_window(app),
-            TRAY_MENU_AUTO_RECOVER => {
+        .on_menu_event(|app, event| match tray_menu_action(event.id().as_ref()) {
+            Some(TrayMenuAction::Show) => show_main_window(app),
+            Some(TrayMenuAction::ToggleAutoRecover) => {
                 if let Err(err) = toggle_auto_recover_from_tray(app) {
                     tracing::warn!("failed to toggle auto recover from tray: {err:#}");
                 }
             }
-            TRAY_MENU_QUIT => quit_app(app),
+            Some(TrayMenuAction::ClearArchived) => {
+                if let Err(err) = clear_archived_from_tray() {
+                    tracing::warn!("failed to clear archived Codex threads from tray: {err:#}");
+                }
+            }
+            Some(TrayMenuAction::Quit) => quit_app(app),
             _ => {}
         })
         .on_window_event(|window, event| {
@@ -253,6 +267,8 @@ fn install_tray_menu(app: &tauri::App) -> Result<()> {
         .separator()
         .item(&auto_item)
         .separator()
+        .text(TRAY_MENU_CLEAR_ARCHIVED, "清除归档")
+        .separator()
         .text(TRAY_MENU_QUIT, "退出 Codex Sentinel")
         .build()?;
     let tray = app
@@ -264,6 +280,16 @@ fn install_tray_menu(app: &tauri::App) -> Result<()> {
         auto_recover: auto_item,
     });
     Ok(())
+}
+
+fn tray_menu_action(id: &str) -> Option<TrayMenuAction> {
+    match id {
+        TRAY_MENU_SHOW => Some(TrayMenuAction::Show),
+        TRAY_MENU_AUTO_RECOVER => Some(TrayMenuAction::ToggleAutoRecover),
+        TRAY_MENU_CLEAR_ARCHIVED => Some(TrayMenuAction::ClearArchived),
+        TRAY_MENU_QUIT => Some(TrayMenuAction::Quit),
+        _ => None,
+    }
 }
 
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -295,6 +321,20 @@ fn toggle_auto_recover_from_tray(app: &tauri::AppHandle) -> Result<()> {
     config::set_auto_recover(enabled)?;
     sync_tray_auto_recover(app, enabled);
     Ok(())
+}
+
+fn clear_archived_from_tray() -> Result<()> {
+    clear_archived_from_tray_with(control_queue::submit_and_wait)?;
+    Ok(())
+}
+
+fn clear_archived_from_tray_with<F>(submit: F) -> Result<String>
+where
+    F: FnOnce(control_queue::ControlAction) -> Result<control_queue::ControlResponse>,
+{
+    let response = submit(control_queue::ControlAction::ClearArchived)?;
+    tracing::info!(message = %response.message, "cleared archived Codex threads from tray");
+    Ok(response.message)
 }
 
 fn sync_tray_auto_recover(app: &tauri::AppHandle, enabled: bool) {
@@ -966,4 +1006,49 @@ fn daemon_log_path() -> std::path::PathBuf {
 
 fn format_error(err: impl std::fmt::Display) -> String {
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_menu_routes_clear_archived_action() {
+        assert_eq!(
+            tray_menu_action(TRAY_MENU_CLEAR_ARCHIVED),
+            Some(TrayMenuAction::ClearArchived)
+        );
+    }
+
+    #[test]
+    fn tray_menu_routes_known_actions_and_ignores_unknown_ids() {
+        assert_eq!(tray_menu_action(TRAY_MENU_SHOW), Some(TrayMenuAction::Show));
+        assert_eq!(
+            tray_menu_action(TRAY_MENU_AUTO_RECOVER),
+            Some(TrayMenuAction::ToggleAutoRecover)
+        );
+        assert_eq!(tray_menu_action(TRAY_MENU_QUIT), Some(TrayMenuAction::Quit));
+        assert_eq!(tray_menu_action("other"), None);
+    }
+
+    #[test]
+    fn tray_clear_archived_uses_control_queue_action() {
+        let mut submitted = None;
+        let message = clear_archived_from_tray_with(|action| {
+            submitted = Some(action);
+            Ok(control_queue::ControlResponse {
+                request_id: String::new(),
+                completed_at: 123,
+                ok: true,
+                message: "已清除 1 条归档线程，1 个 rollout 已移到废纸篓。".to_string(),
+                thread_id: None,
+                turn_id: None,
+                data: None,
+            })
+        })
+        .expect("tray clear succeeds through submitter");
+
+        assert_eq!(submitted, Some(control_queue::ControlAction::ClearArchived));
+        assert!(message.contains("已清除 1 条归档线程"));
+    }
 }
