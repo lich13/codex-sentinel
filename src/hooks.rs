@@ -24,8 +24,11 @@ const STOP_HOOK_DEDUP_WINDOW_SECONDS: i64 = 300;
 const STOP_HOOK_COMPLETION_DEDUP_WINDOW_SECONDS: i64 = 300;
 const RECENT_HOOK_EVENT_LIMIT: usize = 5;
 const HOOK_EVENTS_TAIL_SCAN_BYTES: u64 = 512 * 1024;
+#[cfg(target_os = "macos")]
 const INSTALLED_APP_EXECUTABLE: &str =
     "/Applications/Codex Sentinel.app/Contents/MacOS/codex-sentinel";
+#[cfg(target_os = "windows")]
+const WINDOWS_HELPER_EXE: &str = "codex-sentinel-cli.exe";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookStatus {
@@ -126,6 +129,7 @@ pub fn inspect_hooks() -> Result<HookStatus> {
     let current_executable = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
+    let expected_executable = expected_hook_executable(&current_executable);
     let config_path = codex_config_path();
     let hooks_path = hooks_path();
     let feature_enabled = read_codex_hooks_feature(&config_path).unwrap_or(false);
@@ -141,7 +145,8 @@ pub fn inspect_hooks() -> Result<HookStatus> {
             .with_context(|| format!("failed to parse {}", hooks_path.display()))?;
         installed_commands = collect_sentinel_commands(&value);
         stop_installed = event_has_sentinel_command(&value, "Stop");
-        installed_app_command = installed_app_command_present(&installed_commands);
+        installed_app_command =
+            installed_app_command_present(&installed_commands, &expected_executable);
     }
 
     let mut notes = Vec::new();
@@ -155,7 +160,7 @@ pub fn inspect_hooks() -> Result<HookStatus> {
     }
     if stop_installed && !installed_app_command {
         notes.push(format!(
-            "Stop hook 当前没有指向已安装包：{INSTALLED_APP_EXECUTABLE}。请从 /Applications 安装或修复 Hook。"
+            "Stop hook 当前没有指向当前安装包：{expected_executable}。请重新安装或修复 Hook。"
         ));
     }
     Ok(HookStatus {
@@ -758,7 +763,8 @@ fn add_hook_group(
 }
 
 fn command_for(subcommand: &str) -> Result<String> {
-    let exe = std::env::current_exe()?.display().to_string();
+    let current_executable = std::env::current_exe()?.display().to_string();
+    let exe = expected_hook_executable(&current_executable);
     Ok(format!("\"{}\" {subcommand}", exe.replace('"', "\\\"")))
 }
 
@@ -1080,7 +1086,8 @@ fn spawn_completion_notification(
         latest_feedback: classification.latest_feedback.clone(),
     };
     let raw = serde_json::to_vec(&payload)?;
-    let mut child = Command::new(std::env::current_exe()?)
+    let current_executable = std::env::current_exe()?.display().to_string();
+    let mut child = Command::new(expected_hook_executable(&current_executable))
         .arg("notify-completion")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1348,10 +1355,42 @@ impl From<HookEventLine> for HookEventSummary {
     }
 }
 
-fn installed_app_command_present(commands: &[String]) -> bool {
+fn expected_hook_executable(current_executable: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = current_executable;
+        INSTALLED_APP_EXECUTABLE.to_string()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        expected_windows_helper_executable(current_executable)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn expected_windows_helper_executable(current_executable: &str) -> String {
+    let path = Path::new(current_executable);
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(WINDOWS_HELPER_EXE))
+    {
+        return current_executable.to_string();
+    }
+    path.parent()
+        .map(|parent| parent.join(WINDOWS_HELPER_EXE).display().to_string())
+        .unwrap_or_else(|| current_executable.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn expected_windows_helper_executable(current_executable: &str) -> String {
+    current_executable.to_string()
+}
+
+fn installed_app_command_present(commands: &[String], expected_executable: &str) -> bool {
     commands
         .iter()
-        .any(|command| command.contains(INSTALLED_APP_EXECUTABLE))
+        .any(|command| command.contains(expected_executable))
 }
 
 fn read_tail_lines(path: &Path, max_bytes: u64) -> Result<Vec<String>> {
@@ -1410,6 +1449,7 @@ mod tests {
 
     struct HomeEnvGuard {
         previous: Option<std::ffi::OsString>,
+        previous_test_home: Option<std::ffi::OsString>,
         _lock: MutexGuard<'static, ()>,
     }
 
@@ -1419,11 +1459,14 @@ mod tests {
                 .lock()
                 .expect("HOME env lock poisoned");
             let previous = std::env::var_os("HOME");
+            let previous_test_home = std::env::var_os("CODEX_SENTINEL_TEST_HOME");
             unsafe {
                 std::env::set_var("HOME", home);
+                std::env::set_var("CODEX_SENTINEL_TEST_HOME", home);
             }
             Self {
                 previous,
+                previous_test_home,
                 _lock: lock,
             }
         }
@@ -1436,6 +1479,11 @@ mod tests {
                     std::env::set_var("HOME", previous);
                 } else {
                     std::env::remove_var("HOME");
+                }
+                if let Some(previous) = &self.previous_test_home {
+                    std::env::set_var("CODEX_SENTINEL_TEST_HOME", previous);
+                } else {
+                    std::env::remove_var("CODEX_SENTINEL_TEST_HOME");
                 }
             }
         }
@@ -2270,14 +2318,33 @@ mod tests {
     }
 
     #[test]
-    fn installed_hook_command_must_point_to_app_bundle() {
-        assert!(installed_app_command_present(&[format!(
-            "\"{INSTALLED_APP_EXECUTABLE}\" hook-stop"
-        )]));
-        assert!(!installed_app_command_present(&[
-            "\"/Users/gosu/Documents/codex-sentinel-work/target/debug/codex-sentinel\" hook-stop"
-                .to_string()
-        ]));
+    fn installed_hook_command_must_point_to_expected_executable() {
+        let expected =
+            expected_hook_executable(r"C:\Program Files\Codex Sentinel\codex-sentinel.exe");
+        assert!(installed_app_command_present(
+            &[format!("\"{expected}\" hook-stop")],
+            &expected
+        ));
+        assert!(!installed_app_command_present(
+            &[
+                "\"/Users/gosu/Documents/codex-sentinel-work/target/debug/codex-sentinel\" hook-stop"
+                    .to_string()
+            ],
+            &expected
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_gui_launcher_uses_packaged_cli_for_hooks() {
+        let expected = expected_hook_executable(
+            r"C:\Program Files\Codex Sentinel\Codex Sentinel_0.1.0_windows_x64.exe",
+        );
+
+        assert_eq!(
+            expected,
+            r"C:\Program Files\Codex Sentinel\codex-sentinel-cli.exe"
+        );
     }
 
     #[test]

@@ -48,7 +48,7 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Codex Sentinel",
-    "longDescription": "A macOS dashboard and Telegram controller for monitoring Codex and recovering from transient failures.",
+    "longDescription": "A desktop dashboard and Telegram controller for monitoring Codex and recovering from transient failures.",
     "macOS": {
       "minimumSystemVersion": "12.0",
       "infoPlist": "Info.plist",

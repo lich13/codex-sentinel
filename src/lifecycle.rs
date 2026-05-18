@@ -1,3 +1,17 @@
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod unsupported;
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(target_os = "macos")]
+use self::macos as platform;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+use self::unsupported as platform;
+#[cfg(target_os = "windows")]
+use self::windows as platform;
+
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,6 +22,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use sysinfo::{ProcessStatus, System};
 
+use crate::codex;
 use crate::{config, maintenance};
 
 const LABEL: &str = "local.codex-sentinel";
@@ -80,24 +95,19 @@ pub fn status() -> Result<LifecycleStatus> {
 }
 
 pub fn install_launch_agent() -> Result<PathBuf> {
-    let exe = current_exe()?;
-    let path = launch_agent_path();
-    let stdout = config::config_dir().join("lifecycle.out.log");
-    let stderr = config::config_dir().join("lifecycle.err.log");
-    fs::create_dir_all(config::config_dir())?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::write(&path, launch_agent_plist(&exe, &stdout, &stderr).as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
-
-    reload_launch_agent(&path)?;
+    let exe = helper_exe()?;
+    let path = platform::install_launch_agent(&exe)?;
+    #[cfg(target_os = "windows")]
+    ensure_lifecycle_running_after_install()?;
     Ok(path)
 }
 
+pub fn helper_executable() -> Result<PathBuf> {
+    helper_exe()
+}
+
 pub fn shutdown_followed_processes() -> Result<()> {
-    unload_launch_agent();
+    platform::unload_launch_agent();
     let snapshot = inspect_processes()?;
     stop_followed_processes(&snapshot)
 }
@@ -116,17 +126,8 @@ fn ensure_gui_running(snapshot: &ProcessSnapshot) -> Result<()> {
     if !snapshot.gui_pids.is_empty() {
         return Ok(());
     }
-    let app = app_bundle_path()?;
-    tracing::info!(app = %app.display(), "starting Codex Sentinel GUI because Codex is running");
-    let status = Command::new("open")
-        .arg(&app)
-        .status()
-        .with_context(|| format!("failed to open {}", app.display()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("open {} failed with {status}", app.display()))
-    }
+    let exe = gui_exe()?;
+    platform::ensure_gui_running(snapshot, &exe)
 }
 
 fn ensure_control_worker_running(snapshot: &ProcessSnapshot) -> Result<()> {
@@ -159,7 +160,7 @@ fn spawn_role_process(
     stderr_path: &Path,
     message: &str,
 ) -> Result<()> {
-    let exe = current_exe()?;
+    let exe = helper_exe()?;
     fs::create_dir_all(config::config_dir())?;
     trim_runtime_files_once();
     let stdout = OpenOptions::new()
@@ -170,11 +171,14 @@ fn spawn_role_process(
         .create(true)
         .append(true)
         .open(stderr_path)?;
-    let child = Command::new(&exe)
+    let mut command = Command::new(&exe);
+    command
         .arg(role)
         .stdin(Stdio::null())
         .stdout(stdout)
-        .stderr(stderr)
+        .stderr(stderr);
+    platform::prepare_background_command(&mut command);
+    let child = command
         .spawn()
         .with_context(|| format!("failed to start {role} from {}", exe.display()))?;
     tracing::info!(pid = child.id(), role, "{message}");
@@ -188,15 +192,32 @@ fn trim_runtime_files_once() {
     }
 }
 
-fn stop_followed_processes(snapshot: &ProcessSnapshot) -> Result<()> {
-    for pid in snapshot
+#[cfg(target_os = "windows")]
+fn ensure_lifecycle_running_after_install() -> Result<()> {
+    let snapshot = inspect_processes()?;
+    if !snapshot.lifecycle_pids.is_empty() {
+        return Ok(());
+    }
+    spawn_role_process(
+        "lifecycle",
+        &config::config_dir().join("lifecycle.out.log"),
+        &config::config_dir().join("lifecycle.err.log"),
+        "started Codex Sentinel lifecycle helper after installing Windows Run key",
+    )
+}
+
+fn followed_process_pids(snapshot: &ProcessSnapshot) -> Vec<u32> {
+    snapshot
         .gui_pids
         .iter()
         .chain(snapshot.daemon_pids.iter())
         .chain(snapshot.control_worker_pids.iter())
-        .chain(snapshot.lifecycle_pids.iter())
         .copied()
-    {
+        .collect()
+}
+
+fn stop_followed_processes(snapshot: &ProcessSnapshot) -> Result<()> {
+    for pid in followed_process_pids(snapshot) {
         tracing::info!(
             pid,
             "stopping Codex Sentinel process because Codex is not running"
@@ -207,20 +228,11 @@ fn stop_followed_processes(snapshot: &ProcessSnapshot) -> Result<()> {
 }
 
 fn terminate_pid(pid: u32) -> Result<()> {
-    let status = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .with_context(|| format!("failed to terminate pid {pid}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("kill -TERM {pid} failed with {status}"))
-    }
+    platform::terminate_pid(pid)
 }
 
 fn inspect_processes() -> Result<ProcessSnapshot> {
-    let own_exe = current_exe()?;
+    let own_exes = sentinel_exes()?;
     let current_pid = std::process::id();
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -246,12 +258,12 @@ fn inspect_processes() -> Result<ProcessSnapshot> {
         let name = process.name().to_string_lossy();
         let pid = process.pid().as_u32();
 
-        if is_codex_app_process(&name, &cmd_text) {
+        if codex::is_codex_app_process(&name, &cmd_text) {
             snapshot.codex_running = true;
             continue;
         }
 
-        if pid == current_pid || !is_current_binary(process.exe(), &cmd, &own_exe) {
+        if pid == current_pid || !is_known_sentinel_binary(process.exe(), &cmd, &own_exes) {
             continue;
         }
 
@@ -271,17 +283,13 @@ fn inspect_processes() -> Result<ProcessSnapshot> {
     Ok(snapshot)
 }
 
-fn is_codex_app_process(name: &str, cmd: &str) -> bool {
-    name == "Codex" && cmd.contains("Codex.app/Contents/MacOS/Codex")
-}
-
-fn is_current_binary(exe: Option<&Path>, cmd: &[String], own_exe: &Path) -> bool {
-    if exe.is_some_and(|path| same_path(path, own_exe)) {
+fn is_known_sentinel_binary(exe: Option<&Path>, cmd: &[String], known_exes: &[PathBuf]) -> bool {
+    if exe.is_some_and(|path| known_exes.iter().any(|known| same_path(path, known))) {
         return true;
     }
     cmd.first()
         .map(Path::new)
-        .is_some_and(|path| same_path(path, own_exe))
+        .is_some_and(|path| known_exes.iter().any(|known| same_path(path, known)))
 }
 
 fn sentinel_role(cmd: &[String]) -> SentinelRole {
@@ -313,10 +321,16 @@ fn sentinel_role(cmd: &[String]) -> SentinelRole {
                 | "--clear-archived"
                 | "desktop-control-status"
                 | "--desktop-control-status"
+                | "debug-visible-send-plan"
+                | "--debug-visible-send-plan"
                 | "debug-new-chat"
                 | "--debug-new-chat"
                 | "debug-new-direct"
                 | "--debug-new-direct"
+                | "debug-thread-failure-state"
+                | "--debug-thread-failure-state"
+                | "debug-app-server-thread"
+                | "--debug-app-server-thread"
                 | "open-desktop-permissions"
                 | "--open-desktop-permissions"
                 | "hook-status"
@@ -325,6 +339,8 @@ fn sentinel_role(cmd: &[String]) -> SentinelRole {
                 | "--install-hooks"
                 | "hook-stop"
                 | "--hook-stop"
+                | "notify-completion"
+                | "--notify-completion"
                 | "config"
                 | "--config"
                 | "install-launch-agent"
@@ -354,127 +370,28 @@ fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("failed to resolve current executable")
 }
 
-fn app_bundle_path() -> Result<PathBuf> {
-    let exe = current_exe()?;
-    let macos = exe
-        .parent()
-        .ok_or_else(|| anyhow!("cannot resolve executable parent"))?;
-    let contents = macos
-        .parent()
-        .ok_or_else(|| anyhow!("cannot resolve app Contents directory"))?;
-    let app = contents
-        .parent()
-        .ok_or_else(|| anyhow!("cannot resolve app bundle directory"))?;
-    if app.extension().and_then(|ext| ext.to_str()) == Some("app") {
-        Ok(app.to_path_buf())
-    } else {
-        Ok(PathBuf::from("/Applications/Codex Sentinel.app"))
-    }
+fn helper_exe() -> Result<PathBuf> {
+    platform::helper_exe(&current_exe()?)
+}
+
+fn gui_exe() -> Result<PathBuf> {
+    platform::gui_exe(&current_exe()?)
+}
+
+fn sentinel_exes() -> Result<Vec<PathBuf>> {
+    let current = current_exe()?;
+    let mut exes = vec![
+        current.clone(),
+        platform::helper_exe(&current)?,
+        platform::gui_exe(&current)?,
+    ];
+    exes.sort();
+    exes.dedup_by(|left, right| same_path(left, right));
+    Ok(exes)
 }
 
 fn launch_agent_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Library/LaunchAgents")
-        .join(format!("{LABEL}.plist"))
-}
-
-fn launch_agent_plist(exe: &Path, stdout: &Path, stderr: &Path) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe}</string>
-    <string>lifecycle</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{stdout}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr}</string>
-</dict>
-</plist>
-"#,
-        label = LABEL,
-        exe = xml_escape(&exe.display().to_string()),
-        stdout = xml_escape(&stdout.display().to_string()),
-        stderr = xml_escape(&stderr.display().to_string()),
-    )
-}
-
-fn reload_launch_agent(path: &Path) -> Result<()> {
-    let domain = format!("gui/{}", current_uid()?);
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain])
-        .arg(path)
-        .status();
-
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &domain])
-        .arg(path)
-        .status()
-        .with_context(|| format!("failed to bootstrap {}", path.display()))?;
-    if !status.success() {
-        return Err(anyhow!(
-            "launchctl bootstrap {} {} failed with {status}",
-            domain,
-            path.display()
-        ));
-    }
-
-    let service = format!("{domain}/{LABEL}");
-    let status = Command::new("launchctl")
-        .args(["kickstart", "-k", &service])
-        .status()
-        .with_context(|| format!("failed to kickstart {service}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "launchctl kickstart {service} failed with {status}"
-        ))
-    }
-}
-
-fn unload_launch_agent() {
-    let Ok(uid) = current_uid() else {
-        return;
-    };
-    let domain = format!("gui/{uid}");
-    let path = launch_agent_path();
-    let service = format!("{domain}/{LABEL}");
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain])
-        .arg(&path)
-        .status();
-    let _ = Command::new("launchctl")
-        .args(["bootout", &service])
-        .status();
-}
-
-fn current_uid() -> Result<String> {
-    let output = Command::new("id").arg("-u").output()?;
-    if !output.status.success() {
-        return Err(anyhow!("id -u failed with {}", output.status));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn xml_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    platform::launch_agent_path()
 }
 
 #[cfg(test)]
@@ -504,17 +421,43 @@ mod tests {
             sentinel_role(&cmd(&["codex-sentinel", "hook-stop"])),
             SentinelRole::Other
         );
+        assert_eq!(
+            sentinel_role(&cmd(&["codex-sentinel", "debug-visible-send-plan"])),
+            SentinelRole::Other
+        );
+        assert_eq!(
+            sentinel_role(&cmd(&["codex-sentinel", "debug-thread-failure-state"])),
+            SentinelRole::Other
+        );
+        assert_eq!(
+            sentinel_role(&cmd(&["codex-sentinel", "debug-app-server-thread"])),
+            SentinelRole::Other
+        );
+        assert_eq!(
+            sentinel_role(&cmd(&["codex-sentinel", "notify-completion"])),
+            SentinelRole::Other
+        );
     }
 
     #[test]
-    fn detects_codex_app_not_helpers() {
-        assert!(is_codex_app_process(
-            "Codex",
-            "/Applications/Codex.app/Contents/MacOS/Codex"
-        ));
-        assert!(!is_codex_app_process(
-            "Codex Helper",
-            "/Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper"
-        ));
+    fn codex_absent_stop_plan_keeps_lifecycle_helper_running() {
+        let snapshot = ProcessSnapshot {
+            codex_running: false,
+            gui_pids: vec![101],
+            daemon_pids: vec![202],
+            control_worker_pids: vec![303],
+            lifecycle_pids: vec![404],
+        };
+
+        assert_eq!(followed_process_pids(&snapshot), vec![101, 202, 303]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_launch_agent_path_targets_run_key() {
+        let path = launch_agent_path();
+        let text = path.display().to_string();
+        assert!(text.contains("CurrentVersion\\Run"));
+        assert!(text.contains("local.codex-sentinel"));
     }
 }

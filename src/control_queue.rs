@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
@@ -308,18 +308,12 @@ fn append_json_line_locked<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 fn lock_file(file: &File) -> Result<()> {
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error()).context("failed to lock control queue")
-    }
+    file.lock_exclusive()
+        .context("failed to lock control queue")
 }
 
 fn unlock_file(file: &File) {
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-    }
+    let _ = file.unlock();
 }
 
 fn request_id() -> String {

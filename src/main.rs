@@ -17,6 +17,11 @@ pub(crate) static TEST_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if should_detach_console_for_gui(&args) {
+        detach_console_for_gui();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -24,7 +29,6 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         Some("--status") | Some("status") => {
             let status = codex::collect_status()?;
@@ -97,9 +101,10 @@ async fn main() -> Result<()> {
                 .get(1)
                 .map(String::as_str)
                 .unwrap_or("继续干。请读取当前状态后开始。");
+            let path = args.get(2).and_then(|value| non_empty_arg(value));
             let result = control_queue::submit_and_wait(control_queue::ControlAction::NewThread {
                 prompt: prompt.to_string(),
-                path: None,
+                path: path.map(str::to_string),
             })?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
@@ -120,15 +125,24 @@ async fn main() -> Result<()> {
             let status = desktop_control::inspect();
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
+        Some("--debug-visible-send-plan") | Some("debug-visible-send-plan") => {
+            let plan = desktop_control::debug_visible_send_plan();
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
         Some("--debug-new-chat") | Some("debug-new-chat") => {
-            desktop_control::prepare_new_thread_visible(None)?;
+            desktop_control::prepare_new_thread_visible(
+                args.get(1).and_then(|value| non_empty_arg(value)),
+            )?;
             println!("opened visible Codex new chat");
         }
         Some("--debug-new-direct") | Some("debug-new-direct") => {
             let prompt = args.get(1).map(String::as_str).unwrap_or(
                 "Sentinel debug new thread: please reply with a short acknowledgment only.",
             );
-            let result = codex::start_new_thread(prompt, None)?;
+            let result = codex::start_new_thread(
+                prompt,
+                args.get(2).and_then(|value| non_empty_arg(value)),
+            )?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Some("--debug-thread-failure-state") | Some("debug-thread-failure-state") => {
@@ -205,12 +219,13 @@ fn print_help() {
            codex-sentinel lifecycle    Follow Codex.app and manage Sentinel GUI/daemon\n\
            codex-sentinel continue [thread_id]\n\
            codex-sentinel append <thread_id> <prompt>\n\
-           codex-sentinel new [prompt]\n\
+           codex-sentinel new [prompt] [path]\n\
            codex-sentinel delete <thread_id>\n\
            codex-sentinel clear-archived\n\
            codex-sentinel desktop-control-status\n\
-           codex-sentinel debug-new-chat\n\
-           codex-sentinel debug-new-direct [prompt]\n\
+           codex-sentinel debug-visible-send-plan\n\
+           codex-sentinel debug-new-chat [path]\n\
+           codex-sentinel debug-new-direct [prompt] [path]\n\
            codex-sentinel debug-thread-failure-state [thread_id]\n\
            codex-sentinel debug-app-server-thread [thread_id]\n\
            codex-sentinel lifecycle-status\n\
@@ -221,4 +236,43 @@ fn print_help() {
            codex-sentinel install-hooks\n\
            codex-sentinel config       Create/show config\n"
     );
+}
+
+fn non_empty_arg(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn should_detach_console_for_gui(args: &[String]) -> bool {
+    cfg!(target_os = "windows") && args.is_empty()
+}
+
+#[cfg(target_os = "windows")]
+fn detach_console_for_gui() {
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detach_console_for_gui() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detaches_console_only_for_gui_launch() {
+        assert!(should_detach_console_for_gui(&[]));
+
+        let status_args = vec!["status".to_string()];
+        assert!(!should_detach_console_for_gui(&status_args));
+
+        let daemon_args = vec!["daemon".to_string()];
+        assert!(!should_detach_console_for_gui(&daemon_args));
+    }
 }

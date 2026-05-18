@@ -1,4 +1,4 @@
-name: Build and Release macOS arm64
+name: Build and Release
 
 on:
   push:
@@ -30,8 +30,8 @@ run-name: >-
     github.event_name == 'workflow_dispatch' && inputs.version != ''
       && format('Build and release {0}', inputs.version)
       || github.event_name == 'workflow_dispatch'
-      && 'Build macOS arm64 artifacts (manual)'
-      || format('Build macOS arm64 for {0}', github.ref_name)
+      && 'Build release artifacts (manual)'
+      || format('Build release artifacts for {0}', github.ref_name)
   }}
 
 jobs:
@@ -109,9 +109,51 @@ jobs:
       - name: Build UI
         run: npm run build:ui
 
+  test-windows:
+    name: CI Windows
+    needs: [resolve-version]
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          workspaces: |
+            . -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run Rust tests
+        run: cargo test
+
+      - name: Build UI
+        run: npm run build:ui
+
+      - name: Build Windows Tauri app
+        run: npm run tauri:build:windows
+
   build-macos:
     name: Build macOS arm64 DMG
-    needs: [resolve-version, test-macos]
+    needs: [resolve-version, test-macos, test-windows]
     runs-on: macos-14
 
     steps:
@@ -180,9 +222,54 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  build-windows:
+    name: Build Windows x64 EXE
+    needs: [resolve-version, test-macos, test-windows]
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          workspaces: |
+            . -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync app version
+        run: node scripts/set-app-version.mjs --version "${{ needs.resolve-version.outputs.version }}"
+
+      - name: Build Windows release exe
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Version "${{ needs.resolve-version.outputs.version }}"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-exe-x64
+          path: dist/*.exe
+          if-no-files-found: error
+          compression-level: 0
+
   publish-release:
     name: Publish GitHub Release
-    needs: [build-macos]
+    needs: [build-macos, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.version != '')
 
@@ -224,7 +311,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          mapfile -t release_files < <(find release-assets -maxdepth 1 -type f -name '*.dmg' | sort)
+          mapfile -t release_files < <(find release-assets -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.exe' \) | sort)
 
           if [[ "${#release_files[@]}" -eq 0 ]]; then
             echo "No release assets found." >&2

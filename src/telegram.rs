@@ -319,7 +319,7 @@ async fn watch_once(
             tracing::info!(
                 thread_id = %candidate.thread.id,
                 label = %candidate.decision.label,
-                "automatic visible recovery skipped because Accessibility is not granted"
+                "automatic visible recovery skipped because visible input is not ready"
             );
             continue;
         }
@@ -327,7 +327,7 @@ async fn watch_once(
             tracing::info!(
                 thread_id = %candidate.thread.id,
                 label = %candidate.decision.label,
-                "automatic visible recovery skipped because Screen Recording is not granted"
+                "automatic visible recovery skipped because visible state inspection is not ready"
             );
             continue;
         }

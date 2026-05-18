@@ -6,6 +6,8 @@ use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use sysinfo::System;
 use tauri::menu::{CheckMenuItem, MenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -212,7 +214,14 @@ pub fn run_gui() -> Result<()> {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                match main_window_close_action() {
+                    MainWindowCloseAction::Hide => {
+                        let _ = window.hide();
+                    }
+                    MainWindowCloseAction::Minimize => {
+                        let _ = window.minimize();
+                    }
+                }
             }
         })
         .on_tray_icon_event(|app, event| {
@@ -295,7 +304,23 @@ fn tray_menu_action(id: &str) -> Option<TrayMenuAction> {
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
+        #[cfg(target_os = "windows")]
+        let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainWindowCloseAction {
+    Hide,
+    Minimize,
+}
+
+fn main_window_close_action() -> MainWindowCloseAction {
+    if cfg!(target_os = "windows") {
+        MainWindowCloseAction::Minimize
+    } else {
+        MainWindowCloseAction::Hide
     }
 }
 
@@ -714,13 +739,14 @@ fn start_telegram_daemon() -> std::result::Result<DaemonStartResult, String> {
         .open(err_path)
         .map_err(format_error)?;
 
-    let child = Command::new(std::env::current_exe().map_err(format_error)?)
+    let mut command = Command::new(lifecycle::helper_executable().map_err(format_error)?);
+    command
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .map_err(format_error)?;
+        .stderr(stderr);
+    prepare_background_command(&mut command);
+    let child = command.spawn().map_err(format_error)?;
 
     Ok(DaemonStartResult {
         already_running: false,
@@ -733,15 +759,7 @@ fn start_telegram_daemon() -> std::result::Result<DaemonStartResult, String> {
 fn reveal_config_dir() -> std::result::Result<(), String> {
     let dir = config::config_dir();
     std::fs::create_dir_all(&dir).map_err(format_error)?;
-    let status = std::process::Command::new("open")
-        .arg(&dir)
-        .status()
-        .map_err(format_error)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("open {} failed with {status}", dir.display()))
-    }
+    reveal_path(&dir).map_err(format_error)
 }
 
 #[tauri::command]
@@ -987,6 +1005,10 @@ fn telegram_client() -> Result<Client> {
 }
 
 fn telegram_daemon_running() -> bool {
+    if let Ok(status) = lifecycle::status() {
+        return status.daemon_running;
+    }
+
     let mut sys = System::new_all();
     sys.refresh_all();
     sys.processes().values().any(|process| {
@@ -1000,12 +1022,54 @@ fn telegram_daemon_running() -> bool {
     })
 }
 
+fn prepare_background_command(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = command;
+    }
+}
+
 fn daemon_log_path() -> std::path::PathBuf {
     config::config_dir().join("telegram-daemon.out.log")
 }
 
 fn format_error(err: impl std::fmt::Display) -> String {
     err.to_string()
+}
+
+fn reveal_path(path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer.exe");
+        command.arg(path);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to reveal {}", path.display()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("reveal {} failed with {status}", path.display()))
+    }
 }
 
 #[cfg(test)]
@@ -1050,5 +1114,14 @@ mod tests {
 
         assert_eq!(submitted, Some(control_queue::ControlAction::ClearArchived));
         assert!(message.contains("已清除 1 条归档线程"));
+    }
+
+    #[test]
+    fn close_action_matches_platform_expectation() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(main_window_close_action(), MainWindowCloseAction::Minimize);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(main_window_close_action(), MainWindowCloseAction::Hide);
     }
 }

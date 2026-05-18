@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(6);
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "macos")]
 const BUNDLED_CODEX_CLI: &str = "/Applications/Codex.app/Contents/Resources/codex";
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -83,11 +86,14 @@ struct AppServerClient {
 
 impl AppServerClient {
     fn start() -> Result<Self> {
-        let mut child = Command::new(codex_cli_path())
+        let mut command = Command::new(codex_cli_path());
+        command
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        prepare_app_server_command(&mut command);
+        let mut child = command
             .spawn()
             .context("failed to start Codex app-server probe")?;
 
@@ -209,13 +215,174 @@ impl Drop for AppServerClient {
     }
 }
 
-fn codex_cli_path() -> PathBuf {
-    let bundled = PathBuf::from(BUNDLED_CODEX_CLI);
-    if bundled.exists() {
-        bundled
-    } else {
-        PathBuf::from("codex")
+pub fn codex_cli_path() -> PathBuf {
+    for candidate in codex_cli_candidates() {
+        if let Some(path) = resolve_cli_candidate(&candidate) {
+            return path;
+        }
     }
+    PathBuf::from("codex")
+}
+
+fn codex_cli_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    candidates.push(PathBuf::from(BUNDLED_CODEX_CLI));
+    #[cfg(target_os = "windows")]
+    {
+        candidates.extend(running_windows_codex_cli_candidates());
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(
+                PathBuf::from(local_app_data)
+                    .join("OpenAI")
+                    .join("Codex")
+                    .join("bin")
+                    .join("codex.exe"),
+            );
+        }
+        candidates.push(PathBuf::from("codex.exe"));
+    }
+    candidates.push(PathBuf::from("codex"));
+    candidates
+}
+
+fn resolve_cli_candidate(candidate: &Path) -> Option<PathBuf> {
+    let path = if is_bare_command(candidate) {
+        find_on_path(candidate)
+    } else {
+        candidate.exists().then(|| candidate.to_path_buf())
+    }?;
+    cli_candidate_can_start(&path).then_some(path)
+}
+
+fn is_bare_command(path: &Path) -> bool {
+    !path.is_absolute() && path.components().count() == 1
+}
+
+fn find_on_path(name: &Path) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let direct = dir.join(name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        #[cfg(target_os = "windows")]
+        if name.extension().is_none() {
+            for ext in windows_path_extensions() {
+                let candidate = dir.join(format!("{}{}", name.display(), ext));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn cli_candidate_can_start(path: &Path) -> bool {
+    let mut command = Command::new(path);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    prepare_cli_probe_command(&mut command);
+
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(40)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn prepare_cli_probe_command(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = command;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_path_extensions() -> Vec<String> {
+    std::env::var_os("PATHEXT")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    if value.starts_with('.') {
+                        value.to_string()
+                    } else {
+                        format!(".{value}")
+                    }
+                })
+                .collect()
+        })
+        .filter(|values: &Vec<String>| !values.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                ".COM".to_string(),
+                ".EXE".to_string(),
+                ".BAT".to_string(),
+                ".CMD".to_string(),
+            ]
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn running_windows_codex_cli_candidates() -> Vec<PathBuf> {
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_all();
+    let mut candidates = Vec::new();
+    for process in sys.processes().values() {
+        let name = process.name().to_string_lossy();
+        let Some(exe) = process.exe() else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("codex.exe") {
+            candidates.push(exe.to_path_buf());
+            continue;
+        }
+        if !name.eq_ignore_ascii_case("Codex.exe") {
+            continue;
+        }
+        let cmd = process
+            .cmd()
+            .iter()
+            .map(|part| part.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lower_cmd = cmd.to_ascii_lowercase();
+        if lower_cmd.contains("--type=") {
+            continue;
+        }
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("resources").join("codex.exe"));
+        }
+    }
+    candidates
 }
 
 fn probe_from_thread_value(thread_id: &str, thread: &Value) -> ThreadProbe {
@@ -360,4 +527,27 @@ mod tests {
         assert!(!probe.has_terminal_failure());
         assert!(probe.is_known_running());
     }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn app_server_probe_command_is_hidden_on_windows() {
+        assert_ne!(windows_hidden_creation_flags() & CREATE_NO_WINDOW, 0);
+    }
+}
+
+fn prepare_app_server_command(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_hidden_creation_flags());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = command;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_hidden_creation_flags() -> u32 {
+    CREATE_NO_WINDOW
 }

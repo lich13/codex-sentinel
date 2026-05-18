@@ -671,12 +671,16 @@ async function openDesktopPermissions() {
   state.notice = null;
   render();
   try {
+    if (desktopControlIsWindows(state.payload?.desktop_control ?? null)) {
+      state.notice = 'Windows 端不显示该入口。';
+      return;
+    }
     if (useMock) {
-      state.notice = 'Mock 模式：已打开系统权限设置。';
+      state.notice = 'Mock 模式：无需打开该入口。';
       return;
     }
     state.payload = await invoke<DashboardPayload>('open_desktop_permissions');
-    state.notice = '已打开系统权限设置。授权辅助功能后回到这里刷新状态。';
+    state.notice = '已刷新可见控制状态。';
   } catch (error) {
     state.error = stringifyError(error);
   } finally {
@@ -701,6 +705,7 @@ function render() {
   const { status, config, hooks } = payload;
   const telegram = payload.telegram;
   const desktopControl = payload.desktop_control;
+  const desktopControlWindows = desktopControlIsWindows(desktopControl);
   const telegramDraft = state.telegramDraft ?? draftFromTelegram(telegram);
   const runtimeDraft = state.runtimeDraft ?? draftFromConfig(config);
   const activeThread = status.recent_threads[0] ?? null;
@@ -735,7 +740,17 @@ function render() {
 
     <section class="overview-grid">
       ${healthCard('Codex APP', status.codex_running, status.codex_running ? '正在运行' : '未发现进程')}
-      ${healthCard('可见输入', desktopControl.accessibility_granted, desktopControl.accessibility_granted ? '已授权，可直接操作 Codex 窗口' : '需要辅助功能权限')}
+      ${healthCard(
+        desktopControlWindows ? '可见发送' : '可见输入',
+        desktopControl.accessibility_granted,
+        desktopControlWindows
+          ? desktopControl.accessibility_granted
+            ? '可见发送已就绪'
+            : '等待 Codex 窗口可见'
+          : desktopControl.accessibility_granted
+            ? '已准备好直接操作 Codex 窗口'
+            : '需要辅助功能权限',
+      )}
       ${healthCard('Stop Hook', hooksReady, hooksReady ? '停止事件已接入' : '需要安装或修复')}
       ${healthCard('Telegram', config.watch_enabled && telegram.daemon_running, watcherText(config, telegram, recoverableThreads))}
     </section>
@@ -774,12 +789,20 @@ function render() {
 
       <article class="panel controls-panel">
         <div class="panel-head">
-          <span class="panel-title">权限与 Hook</span>
-          <button class="ghost" data-action="open-desktop-permissions">系统授权</button>
+          <span class="panel-title">${desktopControlWindows ? '可见控制与 Hook' : '权限与 Hook'}</span>
+          ${desktopControlWindows ? '' : '<button class="ghost" data-action="open-desktop-permissions">系统授权</button>'}
         </div>
         <div class="hook-steps desktop-steps">
-          ${compactStep('accessibility', desktopControl.accessibility_granted ? 'ok' : 'error', '辅助功能')}
-          ${compactStep('screen', desktopControl.screen_recording_granted ? 'ok' : 'optional', '屏幕录制')}
+          ${compactStep(
+            'accessibility',
+            desktopControl.accessibility_granted ? 'ok' : 'error',
+            desktopControlWindows ? '可见发送' : '辅助功能',
+          )}
+          ${compactStep(
+            'screen',
+            desktopControl.screen_recording_granted ? 'ok' : 'optional',
+            desktopControlWindows ? '窗口可见' : '屏幕录制',
+          )}
           ${compactStep('hook', hooksReady ? 'ok' : 'error', 'Stop Hook')}
           ${compactStep('installed-app', hooks.installed_app_command ? 'ok' : 'error', '安装路径')}
         </div>
@@ -849,6 +872,10 @@ function renderNotice() {
     return `<div class="banner ok">${escapeHtml(state.notice)}</div>`;
   }
   return '';
+}
+
+function desktopControlIsWindows(desktopControl: DesktopControlStatus | null) {
+  return desktopControl?.mode?.includes('windows') ?? false;
 }
 
 function healthCard(title: string, ok: boolean, detail: string) {
@@ -1681,7 +1708,7 @@ function mockDashboard(
       screen_recording_granted: true,
       notes: hooksReady
         ? []
-        : ['需要在系统设置 -> 隐私与安全性 -> 辅助功能 中允许 Codex Sentinel，才能在 Codex APP 可见窗口内点击和输入。'],
+        : ['可见输入会在 Stop Hook 安装后启用；Windows 端直接使用可见控制。'],
     },
     recoverable_threads: [],
     active_feedback: {

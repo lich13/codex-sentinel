@@ -7,12 +7,8 @@ build = "build.rs"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-core-foundation = "0.10"
-core-graphics = { version = "0.25", features = ["elcapitan"] }
 dirs = "6"
-foreign-types = "0.5"
-image = { version = "0.25", default-features = false, features = ["png"] }
-libc = "0.2"
+fs2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +19,25 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = { version = "0.25", features = ["elcapitan"] }
+foreign-types = "0.5"
+image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 tauri-build = { version = "2.6.1", features = [] }

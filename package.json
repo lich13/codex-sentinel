@@ -9,9 +9,12 @@
     "check": "cargo check",
     "test": "cargo test",
     "ci": "cargo fmt -- --check && cargo test && npm run build:ui",
+    "probe:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-probe.ps1",
+    "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1",
     "tauri": "tauri",
     "tauri:build": "npm run tauri:build:mac:arm64",
-    "tauri:build:mac:arm64": "tauri build --bundles dmg --target aarch64-apple-darwin"
+    "tauri:build:mac:arm64": "tauri build --bundles dmg --target aarch64-apple-darwin",
+    "tauri:build:windows": "tauri build --no-bundle"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0"

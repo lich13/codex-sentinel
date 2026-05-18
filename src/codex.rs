@@ -152,9 +152,17 @@ struct RolloutRecoveryScan {
 }
 
 pub fn codex_home() -> PathBuf {
-    dirs::home_dir()
+    user_home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codex")
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = std::env::var_os("CODEX_SENTINEL_TEST_HOME") {
+        return Some(PathBuf::from(home));
+    }
+    dirs::home_dir()
 }
 
 pub fn state_db_path() -> PathBuf {
@@ -177,7 +185,7 @@ fn codex_process_status() -> CodexProcessStatus {
             .collect::<Vec<_>>()
             .join(" ");
         let name = process.name().to_string_lossy();
-        if name == "Codex" || cmd.contains("/Applications/Codex.app") {
+        if is_codex_app_process(&name, &cmd) {
             status.codex_running = true;
         }
     }
@@ -186,6 +194,16 @@ fn codex_process_status() -> CodexProcessStatus {
 
 pub fn codex_app_running() -> bool {
     codex_process_status().codex_running
+}
+
+pub(crate) fn is_codex_app_process(name: &str, cmd: &str) -> bool {
+    if name == "Codex" || cmd.contains("/Applications/Codex.app") {
+        return true;
+    }
+    let lower_cmd = cmd.to_ascii_lowercase();
+    name.eq_ignore_ascii_case("Codex.exe")
+        && !lower_cmd.contains("--type=")
+        && !lower_cmd.contains("resources\\codex.exe")
 }
 
 pub fn read_recent_threads(limit: usize) -> Result<Vec<ThreadSummary>> {
@@ -1525,7 +1543,7 @@ fn archive_rollout_file(path: &str) -> Result<PathBuf> {
 }
 
 fn user_trash_dir() -> Result<PathBuf> {
-    let trash_dir = dirs::home_dir()
+    let trash_dir = user_home_dir()
         .ok_or_else(|| anyhow!("failed to resolve user home directory"))?
         .join(".Trash");
     fs::create_dir_all(&trash_dir)
@@ -1946,6 +1964,7 @@ mod tests {
 
     struct HomeEnvGuard {
         previous: Option<std::ffi::OsString>,
+        previous_test_home: Option<std::ffi::OsString>,
         _lock: MutexGuard<'static, ()>,
     }
 
@@ -1955,11 +1974,14 @@ mod tests {
                 .lock()
                 .expect("HOME env lock poisoned");
             let previous = std::env::var_os("HOME");
+            let previous_test_home = std::env::var_os("CODEX_SENTINEL_TEST_HOME");
             unsafe {
                 std::env::set_var("HOME", home);
+                std::env::set_var("CODEX_SENTINEL_TEST_HOME", home);
             }
             Self {
                 previous,
+                previous_test_home,
                 _lock: lock,
             }
         }
@@ -1972,6 +1994,11 @@ mod tests {
                     std::env::set_var("HOME", previous);
                 } else {
                     std::env::remove_var("HOME");
+                }
+                if let Some(previous) = &self.previous_test_home {
+                    std::env::set_var("CODEX_SENTINEL_TEST_HOME", previous);
+                } else {
+                    std::env::remove_var("CODEX_SENTINEL_TEST_HOME");
                 }
             }
         }
